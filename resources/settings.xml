@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<settings>
+    <category label="Real-Debrid">
+        <setting id="rd_api_key" type="text" label="API Key (from real-debrid.com/apitoken)" default="" option="hidden"/>
+        <setting id="authorize_rd" type="action" label="Or: Authorize via device code (QR)" action="RunPlugin(plugin://plugin.video.kdmm/?action=authorize_rd)"/>
+        <setting id="revoke_rd" type="action" label="Revoke Real-Debrid Authorization" action="RunPlugin(plugin://plugin.video.kdmm/?action=revoke_rd)"/>
+        <setting id="rd_client_id" type="text" label="" visible="false" default=""/>
+        <setting id="rd_client_secret" type="text" label="" visible="false" default=""/>
+        <setting id="rd_access_token" type="text" label="" visible="false" default=""/>
+        <setting id="rd_refresh_token" type="text" label="" visible="false" default=""/>
+        <setting id="rd_token_expiry" type="text" label="" visible="false" default="0"/>
+    </category>
+    <category label="Cache">
+        <setting id="stream_cache_ttl_hours" type="number" label="Stream cache duration (hours)" default="6"/>
+        <setting id="notify_cache_hit" type="bool" label="Notify on cache hit" default="false"/>
+        <setting id="clear_stream_cache" type="action" label="Clear stream cache" action="RunPlugin(plugin://plugin.video.kdmm/?action=clear_cache)"/>
+    </category>
+</settings>
