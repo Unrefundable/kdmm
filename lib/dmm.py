@@ -57,6 +57,19 @@ def _get_requests():
     return requests
 
 
+# Module-level session — reuses TCP/SSL connections across all RD calls.
+_rd_session = None
+
+
+def _get_session():
+    """Return a shared requests.Session (created once, reused across calls)."""
+    global _rd_session
+    if _rd_session is None:
+        requests = _get_requests()
+        _rd_session = requests.Session()
+    return _rd_session
+
+
 # ------------------------------------------------------------------ #
 # DMM token generation  (port of src/utils/token.ts)
 # ------------------------------------------------------------------ #
@@ -108,8 +121,8 @@ def _get_rd_timestamp(api_token=None):
     Falls back to local time if the request fails.
     """
     try:
-        requests = _get_requests()
-        resp = requests.get(f"{_RD_BASE}/time/iso", timeout=3)
+        s = _get_session()
+        resp = s.get(f"{_RD_BASE}/time/iso", timeout=3)
         resp.raise_for_status()
         from datetime import datetime, timezone
         iso = resp.text.strip().strip('"')
@@ -149,7 +162,7 @@ def _validate_rd_token(api_token):
     Verify the token is accepted by RD by calling GET /user.
     Returns True if valid, False if 401/403, None on network error.
     """
-    requests = _get_requests()
+    requests = _get_session()
     try:
         resp = requests.get(f"{_RD_BASE}/user", headers=_rd_headers(api_token), timeout=10)
         if resp.status_code in (401, 403):
@@ -167,8 +180,8 @@ def _rd_headers(api_token):
 
 
 def _rd_get(path, api_token, timeout=6):
-    requests = _get_requests()
-    r = requests.get(f"{_RD_BASE}{path}", headers=_rd_headers(api_token), timeout=timeout)
+    s = _get_session()
+    r = s.get(f"{_RD_BASE}{path}", headers=_rd_headers(api_token), timeout=timeout)
     r.raise_for_status()
     text = r.text.strip()
     if not text:
@@ -177,9 +190,9 @@ def _rd_get(path, api_token, timeout=6):
 
 
 def _rd_post(path, api_token, data=None, timeout=6):
-    requests = _get_requests()
-    r = requests.post(f"{_RD_BASE}{path}", headers=_rd_headers(api_token),
-                      data=data or {}, timeout=timeout)
+    s = _get_session()
+    r = s.post(f"{_RD_BASE}{path}", headers=_rd_headers(api_token),
+               data=data or {}, timeout=timeout)
     r.raise_for_status()
     text = r.text.strip()
     if not text:
@@ -188,9 +201,9 @@ def _rd_post(path, api_token, data=None, timeout=6):
 
 
 def _rd_delete(path, api_token, timeout=5):
-    requests = _get_requests()
+    s = _get_session()
     try:
-        requests.delete(f"{_RD_BASE}{path}", headers=_rd_headers(api_token), timeout=timeout)
+        s.delete(f"{_RD_BASE}{path}", headers=_rd_headers(api_token), timeout=timeout)
     except Exception:
         pass  # delete is best-effort cleanup
 
@@ -217,8 +230,8 @@ def _fetch_dmm_hashes(imdb_id, media_type="movie", max_size=0, page=0, api_token
     )
 
     _log(f"Querying DMM hash DB for {imdb_id} ({media_type})")
-    requests = _get_requests()
-    resp = requests.get(url, timeout=20)
+    s = _get_session()
+    resp = s.get(url, timeout=20)
     resp.raise_for_status()
     data = resp.json()
     results = data.get("results") or []
@@ -236,7 +249,7 @@ def _check_rd_availability(hashes, api_token):
     Returns a dict {hash: files_list} for cached hashes, and
     raises PermissionError on 401/403 so the caller can handle auth failures.
     """
-    requests = _get_requests()
+    requests = _get_session()
     cached = {}
     video_exts = (".mkv", ".mp4", ".avi", ".m4v", ".webm", ".ts")
 
@@ -305,13 +318,12 @@ def _cancelled(cancel_event):
     return cancel_event and cancel_event.is_set()
 
 
-def _resolve_by_direct_add(candidates_info, api_token, season=None, episode=None,
-                           max_resolve=3, cancel_event=None):
+def _try_resolve_one(candidate, api_token, season, episode, cancel_event):
     """
-    Resolve streams by adding magnets to RD and checking for instant cache.
-    cancel_event: threading.Event – checked between every RD API call.
+    Try to resolve a single candidate hash via RD direct-add.
+    Returns a {"url", "headers", "name"} dict on success, None on failure.
+    Runs in a worker thread — must be thread-safe.
     """
-    resolved = []
     video_exts = (".mkv", ".mp4", ".avi", ".m4v", ".webm", ".ts")
     ep_markers = []
     if season and episode:
@@ -320,108 +332,152 @@ def _resolve_by_direct_add(candidates_info, api_token, season=None, episode=None
             f"{season}x{int(episode):02d}",
         ]
 
-    for idx, c in enumerate(candidates_info):
+    h8 = candidate['hash'][:8]
+    rd_id = None
+    try:
         if _cancelled(cancel_event):
-            _log("Direct-add cancelled")
-            break
-        if len(resolved) >= max_resolve:
-            break
+            return None
 
-        rd_id = None
-        _log(f"Direct-add attempt {idx+1}/{len(candidates_info)}: {c['hash'][:8]}…")
-        try:
-            magnet = f"magnet:?xt=urn:btih:{c['hash']}"
-            resp = _rd_post("/torrents/addMagnet", api_token,
-                            data={"magnet": magnet})
-            rd_id = resp.get("id")
-            if not rd_id:
-                _log(f"{c['hash'][:8]} addMagnet returned no id: {resp}")
-                continue
+        magnet = f"magnet:?xt=urn:btih:{candidate['hash']}"
+        resp = _rd_post("/torrents/addMagnet", api_token, data={"magnet": magnet})
+        rd_id = resp.get("id")
+        if not rd_id:
+            _log(f"{h8} addMagnet returned no id")
+            return None
 
-            if _cancelled(cancel_event):
-                _rd_delete(f"/torrents/delete/{rd_id}", api_token)
-                break
+        if _cancelled(cancel_event):
+            _rd_delete(f"/torrents/delete/{rd_id}", api_token)
+            return None
 
-            info = _rd_get(f"/torrents/info/{rd_id}", api_token)
-            status = info.get("status", "")
-            _log(f"{c['hash'][:8]} status after addMagnet: {status!r}")
+        info = _rd_get(f"/torrents/info/{rd_id}", api_token)
+        status = info.get("status", "")
+        _log(f"{h8} status: {status!r}")
 
-            if _cancelled(cancel_event):
-                _rd_delete(f"/torrents/delete/{rd_id}", api_token)
-                break
+        if _cancelled(cancel_event):
+            _rd_delete(f"/torrents/delete/{rd_id}", api_token)
+            return None
 
-            # If already downloaded (was in cache), skip file selection
-            if status == "downloaded":
-                pass  # fall through to link handling below
-            elif status == "waiting_files_selection":
-                # Pick the best video file
-                files = info.get("files") or []
-                best_file_id = None
-                best_size = 0
+        if status == "downloaded":
+            pass  # already cached, fall through to links
+        elif status == "waiting_files_selection":
+            files = info.get("files") or []
+            best_file_id = None
+            best_size = 0
+            # First pass: match episode if applicable
+            for f in files:
+                fname = f.get("path", "").lower()
+                fsize = f.get("bytes", 0)
+                if not any(fname.endswith(e) for e in video_exts):
+                    continue
+                if ep_markers and not any(m in fname for m in ep_markers):
+                    continue
+                if fsize > best_size:
+                    best_size = fsize
+                    best_file_id = f.get("id")
+            # Second pass: any video file
+            if not best_file_id:
                 for f in files:
                     fname = f.get("path", "").lower()
                     fsize = f.get("bytes", 0)
-                    if not any(fname.endswith(e) for e in video_exts):
-                        continue
-                    if ep_markers and not any(m in fname for m in ep_markers):
-                        continue
-                    if fsize > best_size:
+                    if any(fname.endswith(e) for e in video_exts) and fsize > best_size:
                         best_size = fsize
                         best_file_id = f.get("id")
-                if not best_file_id:
-                    for f in files:
-                        fname = f.get("path", "").lower()
-                        fsize = f.get("bytes", 0)
-                        if any(fname.endswith(e) for e in video_exts) and fsize > best_size:
-                            best_size = fsize
-                            best_file_id = f.get("id")
-                if not best_file_id:
-                    _log(f"{c['hash'][:8]} no video file found in {len(files)} files")
-                    _rd_delete(f"/torrents/delete/{rd_id}", api_token)
-                    continue
-
-                _rd_post(f"/torrents/selectFiles/{rd_id}", api_token,
-                         data={"files": str(best_file_id)})
-
-                if _cancelled(cancel_event):
-                    _rd_delete(f"/torrents/delete/{rd_id}", api_token)
-                    break
-
-                info = _rd_get(f"/torrents/info/{rd_id}", api_token)
-                if info.get("status") != "downloaded":
-                    _log(f"{c['hash'][:8]} not cached (status={info.get('status')!r})")
-                    _rd_delete(f"/torrents/delete/{rd_id}", api_token)
-                    continue
-            else:
-                # Not cached – magnet_conversion / queued / etc.
-                _log(f"{c['hash'][:8]} not instantly cached")
+            if not best_file_id:
+                _log(f"{h8} no video file in {len(files)} files")
                 _rd_delete(f"/torrents/delete/{rd_id}", api_token)
-                continue
+                return None
 
-            links = info.get("links") or []
-            if not links:
-                _log(f"{c['hash'][:8]} no links in torrent info")
-                _rd_delete(f"/torrents/delete/{rd_id}", api_token)
-                continue
+            _rd_post(f"/torrents/selectFiles/{rd_id}", api_token,
+                     data={"files": str(best_file_id)})
 
             if _cancelled(cancel_event):
                 _rd_delete(f"/torrents/delete/{rd_id}", api_token)
-                break
+                return None
 
-            unrestrict = _rd_post("/unrestrict/link", api_token,
-                                   data={"link": links[0]})
-            url = unrestrict.get("download")
-            filename = unrestrict.get("filename", c.get("title", "Stream"))
-            _rd_delete(f"/torrents/delete/{rd_id}", api_token)
-
-            if url:
-                _log(f"Direct-add resolve OK: {filename!r}")
-                resolved.append({"url": url, "headers": {}, "name": filename})
-
-        except Exception as exc:
-            _log(f"Direct-add failed for {c.get('hash','')[:8]}: {exc}", xbmc.LOGWARNING)
-            if rd_id:
+            info = _rd_get(f"/torrents/info/{rd_id}", api_token)
+            if info.get("status") != "downloaded":
+                _log(f"{h8} not cached (status={info.get('status')!r})")
                 _rd_delete(f"/torrents/delete/{rd_id}", api_token)
+                return None
+        else:
+            _log(f"{h8} not instantly cached")
+            _rd_delete(f"/torrents/delete/{rd_id}", api_token)
+            return None
+
+        links = info.get("links") or []
+        if not links:
+            _log(f"{h8} no links")
+            _rd_delete(f"/torrents/delete/{rd_id}", api_token)
+            return None
+
+        if _cancelled(cancel_event):
+            _rd_delete(f"/torrents/delete/{rd_id}", api_token)
+            return None
+
+        unrestrict = _rd_post("/unrestrict/link", api_token,
+                               data={"link": links[0]})
+        url = unrestrict.get("download")
+        filename = unrestrict.get("filename", candidate.get("title", "Stream"))
+        _rd_delete(f"/torrents/delete/{rd_id}", api_token)
+
+        if url:
+            _log(f"{h8} resolved: {filename!r}")
+            return {"url": url, "headers": {}, "name": filename}
+        return None
+
+    except Exception as exc:
+        _log(f"{h8} failed: {exc}", xbmc.LOGWARNING)
+        if rd_id:
+            _rd_delete(f"/torrents/delete/{rd_id}", api_token)
+        return None
+
+
+def _resolve_by_direct_add(candidates_info, api_token, season=None, episode=None,
+                           max_resolve=1, cancel_event=None):
+    """
+    Resolve streams by adding magnets to RD and checking for instant cache.
+    Runs candidates in PARALLEL (up to 5 threads), returns as soon as
+    max_resolve streams are found.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import threading
+
+    resolved = []
+    # Internal event to signal "we have enough, stop other threads"
+    enough_event = threading.Event()
+
+    # Combine both cancel signals
+    def _should_stop():
+        return _cancelled(cancel_event) or enough_event.is_set()
+
+    # Wrap cancel_event so workers check both
+    class _CombinedEvent:
+        def is_set(self):
+            return _should_stop()
+        def set(self):
+            enough_event.set()
+
+    combined = _CombinedEvent()
+
+    _log(f"Resolving {len(candidates_info)} candidates in parallel (need {max_resolve})")
+
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        futures = {
+            pool.submit(
+                _try_resolve_one, c, api_token, season, episode, combined
+            ): c
+            for c in candidates_info
+        }
+        for future in as_completed(futures):
+            result = future.result()
+            if result:
+                resolved.append(result)
+                if len(resolved) >= max_resolve:
+                    enough_event.set()
+                    break
+            if _cancelled(cancel_event):
+                enough_event.set()
+                break
 
     return resolved
 
@@ -500,7 +556,7 @@ def is_stream_accessible(url, headers):
     Return True when the stream URL points to real video content.
     Returns False only when Content-Length is known and too small.
     """
-    _req = _get_requests()
+    _req = _get_session()
     try:
         resp = _req.head(url, headers=headers, timeout=6, allow_redirects=True)
         cl = int(resp.headers.get("content-length", -1))
@@ -599,11 +655,11 @@ def fetch_all_cached_streams(catalog_type, video_id, cancel_event=None):
         for r in sorted_dmm if len((r.get("hash") or "")) == 40
     ][:10]  # top 10 by quality, resolve up to 3
 
-    _log(f"DMM returned {len(hash_map)} hashes, checking top {len(candidates)} directly on RD")
+    _log(f"DMM returned {len(hash_map)} hashes, checking top {len(candidates)} in parallel on RD")
 
     resolved = _resolve_by_direct_add(
         candidates, api_token, season=season, episode=episode,
-        max_resolve=3, cancel_event=cancel_event,
+        max_resolve=1, cancel_event=cancel_event,
     )
 
     if not resolved:
