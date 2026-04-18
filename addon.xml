@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<addon id="plugin.video.kdmm" version="2.1.9" name="KDMM" provider-name="Unrefundable">
+    <requires>
+        <import addon="xbmc.python" version="3.0.0"/>
+        <import addon="script.module.requests" version="2.9.1"/>
+        <import addon="script.module.qrcode" version="5.1" optional="true"/>
+    </requires>
+    <!-- Plugin source: answers play requests from TMDb Bingie Helper -->
+    <extension point="xbmc.python.pluginsource" library="default.py">
+        <provides>video</provides>
+    </extension>
+    <!-- Service: monitors playback progress and applies resume seeks -->
+    <extension point="xbmc.service" library="service.py" start="login"/>
+    <extension point="xbmc.addon.metadata">
+        <summary lang="en_GB">Kodi Debrid Media Manager - Auto-play with resume</summary>
+        <description lang="en_GB">
+            Queries Debrid Media Manager's torrent database, checks Real-Debrid
+            for cached availability, resolves a direct-play URL, and plays it in
+            the Bingie skin via TMDb Bingie Helper. Supports auto-play, resume
+            from last position, and preferred release group sorting.
+        </description>
+        <platform>all</platform>
+    </extension>
+</addon>

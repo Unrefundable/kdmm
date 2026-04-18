@@ -1,0 +1,19 @@
+{
+  "name": "KDMM (Auto)",
+  "plugin": "plugin.video.kdmm",
+  "api_language": "en-US",
+  "priority": 1,
+  "is_resolvable": "true",
+  "assert": {
+    "play_movie": [
+      "imdb"
+    ],
+    "play_episode": [
+      "imdb",
+      "season",
+      "episode"
+    ]
+  },
+  "play_movie": "plugin://plugin.video.kdmm/?action=play_movie&imdb={imdb}&tmdb={tmdb}&title={title_url}&year={year}",
+  "play_episode": "plugin://plugin.video.kdmm/?action=play_episode&imdb={imdb}&tmdb={tmdb}&season={season}&episode={episode}&title={title_url}&showtitle={showname_url}"
+}
