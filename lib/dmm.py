@@ -6,13 +6,12 @@ Flow:
   1.  Generate a DMM proof-of-work token (port of their JS generateTokenAndHash).
   2.  GET  debridmediamanager.com/api/torrents/movie (or tv)
       → returns every known torrent hash for the IMDB ID.
-  3.  POST api.real-debrid.com/rest/1.0/torrents/instantAvailability/{hashes}
-      → filter to only RD-cached hashes.
-  4.  Sort by preferred groups, then by file size (largest first).
-  5.  For the chosen hash, resolve a direct-play URL via:
-        POST /torrents/addMagnet → POST /torrents/selectFiles →
-        GET  /torrents/info      → POST /unrestrict/link
-      → returns a direct CDN link.
+  3.  Sort candidates by preferred release groups + file size.
+  4.  For each candidate, check RD cache via direct-add:
+        POST /torrents/addMagnet → GET /torrents/info →
+        POST /torrents/selectFiles → check status == 'downloaded' →
+        POST /unrestrict/link → direct CDN URL.
+      (RD's instantAvailability endpoint is permanently disabled.)
 """
 
 import math
@@ -110,8 +109,7 @@ def _get_rd_timestamp(api_token=None):
     """
     try:
         requests = _get_requests()
-        headers = _rd_headers(api_token) if api_token else {}
-        resp = requests.get(f"{_RD_BASE}/time/iso", headers=headers, timeout=5)
+        resp = requests.get(f"{_RD_BASE}/time/iso", timeout=5)
         resp.raise_for_status()
         from datetime import datetime, timezone
         iso = resp.text.strip().strip('"')
@@ -183,9 +181,12 @@ def _rd_post(path, api_token, data=None, timeout=15):
     return r.json()
 
 
-def _rd_delete(path, api_token, timeout=15):
+def _rd_delete(path, api_token, timeout=5):
     requests = _get_requests()
-    requests.delete(f"{_RD_BASE}{path}", headers=_rd_headers(api_token), timeout=timeout)
+    try:
+        requests.delete(f"{_RD_BASE}{path}", headers=_rd_headers(api_token), timeout=timeout)
+    except Exception:
+        pass  # delete is best-effort cleanup
 
 
 # ------------------------------------------------------------------ #
@@ -501,9 +502,13 @@ def is_stream_accessible(url, headers):
 
 def fetch_all_cached_streams(catalog_type, video_id, cancel_event=None):
     """
-    Main entry point.  Queries DMM's hash database, checks RD availability,
-    resolves each cached hash to a direct-play URL, and returns a sorted
-    list of {"url", "headers", "name"} candidates.
+    Main entry point.  Queries DMM's hash database, then resolves cached
+    streams via RD direct-add.  Returns a sorted list of
+    {"url", "headers", "name"} candidates.
+
+    Note: RD's instantAvailability endpoint is permanently disabled
+    (error_code 37), so we skip it entirely and use the direct-add
+    approach: addMagnet → selectFiles → check status == 'downloaded'.
 
     catalog_type: "movie" or "series"
     video_id:     "tt1234567" for movies, "tt1234567:1:2" for episodes
@@ -512,18 +517,9 @@ def fetch_all_cached_streams(catalog_type, video_id, cancel_event=None):
     if not api_token:
         xbmcgui.Dialog().notification(
             "KDMM",
-            "No Real-Debrid API token – authorize in addon settings",
+            "No Real-Debrid API token – enter your API key in addon settings",
             xbmcgui.NOTIFICATION_ERROR, 8000)
         return []
-
-    # Validate token before doing anything else
-    token_ok = _validate_rd_token(api_token)
-    if token_ok is False:
-        xbmcgui.Dialog().notification(
-            "KDMM", "Real-Debrid auth failed – re-authorize in addon settings",
-            xbmcgui.NOTIFICATION_ERROR, 8000)
-        return []
-    # token_ok is None means network error — let's try anyway
 
     # Parse video_id: for series it's "imdb:season:episode"
     parts = video_id.split(":")
@@ -542,8 +538,7 @@ def fetch_all_cached_streams(catalog_type, video_id, cancel_event=None):
         _log(f"DMM hash fetch failed: {exc}", xbmc.LOGERROR)
         xbmcgui.Dialog().notification(
             "KDMM", f"DMM error: {type(exc).__name__}: {str(exc)[:120]}",
-            xbmcgui.NOTIFICATION_ERROR,
-        )
+            xbmcgui.NOTIFICATION_ERROR, 8000)
         return []
 
     if not dmm_results:
@@ -567,110 +562,31 @@ def fetch_all_cached_streams(catalog_type, video_id, cancel_event=None):
             xbmcgui.NOTIFICATION_WARNING, 5000)
         return []
 
-    # 2. Check RD instant availability
-    _log(f"Checking RD availability for {len(hash_map)} hash(es)…")
-    cached, avail_ok = _availability_is_usable(api_token, list(hash_map.keys()))
-    _log(f"{len(cached)} / {len(hash_map)} hashes cached via instantAvailability (ok={avail_ok})")
-
-    # Sort helper used by both paths
+    # 2. Sort candidates by preferred groups + file size and resolve directly
     def _sort_key(entry):
         name = (entry.get("title") or "").lower()
         group_prio = 0 if any(g in name for g in _PREFERRED_GROUPS) else 1
         size = entry.get("fileSize") or entry.get("filesize") or 0
         return (group_prio, -size)
 
-    if not cached:
-        # instantAvailability returned nothing – fall back to direct-add approach
-        _log("instantAvailability returned 0 results, trying direct-add fallback…")
-        xbmcgui.Dialog().notification(
-            "KDMM", f"Checking top 5 streams directly on RD…",
-            xbmcgui.NOTIFICATION_INFO, 4000)
-        sorted_dmm = sorted(dmm_results, key=_sort_key)
-        candidates_direct = [
-            {"hash": (r.get("hash") or "").lower(), "title": r.get("title", "Unknown")}
-            for r in sorted_dmm if len((r.get("hash") or "")) == 40
-        ][:5]  # only top 5 — each needs multiple round-trips
-        resolved = _resolve_by_direct_add(
-            candidates_direct, api_token, season=season, episode=episode,
-            cancel_event=cancel_event,
-        )
-        if not resolved:
-            xbmcgui.Dialog().notification(
-                "KDMM", "No cached streams found for this title on RD",
-                xbmcgui.NOTIFICATION_WARNING, 6000)
-        return resolved
+    sorted_dmm = sorted(dmm_results, key=_sort_key)
+    candidates = [
+        {"hash": (r.get("hash") or "").lower(), "title": r.get("title", "Unknown")}
+        for r in sorted_dmm if len((r.get("hash") or "")) == 40
+    ][:10]  # top 10 by quality, resolve up to 3
 
-    # 3. Build sorted candidate list from availability results
-    candidates_info = []
-    for h, files in cached.items():
-        dmm_entry = hash_map.get(h, {})
-        title = dmm_entry.get("title", "Unknown")
-        video_exts = (".mkv", ".mp4", ".avi", ".m4v", ".webm", ".ts")
-        best_file = None
-        best_size = 0
-        for f in files:
-            if any(f["filename"].lower().endswith(e) for e in video_exts):
-                if f["filesize"] > best_size:
-                    best_file = f
-                    best_size = f["filesize"]
+    _log(f"DMM returned {len(hash_map)} hashes, checking top {len(candidates)} directly on RD")
 
-        if not best_file:
-            continue
+    resolved = _resolve_by_direct_add(
+        candidates, api_token, season=season, episode=episode,
+        max_resolve=3, cancel_event=cancel_event,
+    )
 
-        # For TV series, try to match the correct episode file
-        if season and episode:
-            ep_markers = [
-                f"s{int(season):02d}e{int(episode):02d}",
-                f"s{season}e{episode}",
-                f"{season}x{int(episode):02d}",
-            ]
-            # Check all video files for episode match
-            matched_file = None
-            for f in files:
-                fname_lower = f["filename"].lower()
-                if any(fname_lower.endswith(e) for e in video_exts):
-                    if any(m in fname_lower for m in ep_markers):
-                        if not matched_file or f["filesize"] > matched_file["filesize"]:
-                            matched_file = f
-            if matched_file:
-                best_file = matched_file
-                best_size = matched_file["filesize"]
-
-        candidates_info.append({
-            "hash": h,
-            "file_id": best_file["file_id"],
-            "filename": best_file["filename"],
-            "title": title,
-            "size_mb": best_size / 1024 / 1024,
-        })
-
-    # Stable-sort: preferred groups first, then by size (largest first)
-    def _sort_key_c(c):
-        name = c["title"].lower()
-        group_prio = 0 if any(g in name for g in _PREFERRED_GROUPS) else 1
-        return (group_prio, -(c["size_mb"]))
-
-    candidates_info.sort(key=_sort_key_c)
-
-    _log(f"Resolving {len(candidates_info)} cached candidate(s) via RD…")
-
-    # 4. Resolve each candidate to a direct-play URL
-    resolved = []
-    for c in candidates_info:
-        url, filename = _resolve_rd_stream(c["hash"], c["file_id"], api_token)
-        if url:
-            resolved.append({
-                "url": url,
-                "headers": {},
-                "name": filename or c["filename"] or c["title"],
-            })
-        if len(resolved) >= 10:
-            break  # enough candidates – no need to resolve more
-
-    _log(f"Resolved {len(resolved)} playable stream(s), top: {resolved[0]['name']!r}" if resolved else "No streams resolved")
     if not resolved:
         xbmcgui.Dialog().notification(
-            "KDMM",
-            f"RD: {len(cached)} cached but all resolve attempts failed",
-            xbmcgui.NOTIFICATION_ERROR, 6000)
+            "KDMM", "No cached streams found for this title on RD",
+            xbmcgui.NOTIFICATION_WARNING, 6000)
+    else:
+        _log(f"Resolved {len(resolved)} stream(s), top: {resolved[0]['name']!r}")
+
     return resolved
