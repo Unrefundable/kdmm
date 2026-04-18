@@ -21,6 +21,7 @@ Flow:
 import json
 import os
 import sys
+import threading
 from urllib.parse import parse_qsl, urlencode
 
 import xbmc
@@ -191,19 +192,45 @@ def action_play(params):
     if candidates is None:
         _log(f"Cache miss – querying DMM + RD for {media_id}")
 
+        fetch_result = {}
+
+        def _fetch():
+            try:
+                fetch_result["candidates"] = fetch_all_cached_streams(catalog_type, video_id)
+            except Exception as exc:
+                fetch_result["error"] = exc
+
+        t = threading.Thread(target=_fetch, daemon=True)
+        t.start()
+
         busy_dialog = xbmcgui.DialogProgress()
         busy_dialog.create("KDMM", "Finding best stream…")
-        try:
-            candidates = fetch_all_cached_streams(catalog_type, video_id)
-        finally:
-            busy_dialog.close()
+        dots = 0
+        while t.is_alive():
+            if busy_dialog.iscanceled():
+                busy_dialog.close()
+                xbmcplugin.setResolvedUrl(ADDON_HANDLE, False, xbmcgui.ListItem())
+                return
+            dots = (dots + 1) % 4
+            busy_dialog.update(0, f"Finding best stream{'.' * dots}")
+            xbmc.sleep(500)
+        busy_dialog.close()
+
+        if "error" in fetch_result:
+            _log(f"fetch_all_cached_streams raised: {fetch_result['error']}", xbmc.LOGERROR)
+            xbmcgui.Dialog().notification(
+                "KDMM", f"Error: {fetch_result['error']}",
+                xbmcgui.NOTIFICATION_ERROR, 8000)
+            xbmcplugin.setResolvedUrl(ADDON_HANDLE, False, xbmcgui.ListItem())
+            return
+
+        candidates = fetch_result.get("candidates") or []
 
         if not candidates:
             xbmcgui.Dialog().notification(
                 "KDMM",
                 "No cached streams found – check RD authorization",
-                xbmcgui.NOTIFICATION_ERROR,
-            )
+                xbmcgui.NOTIFICATION_ERROR, 8000)
             xbmcplugin.setResolvedUrl(ADDON_HANDLE, False, xbmcgui.ListItem())
             return
 
