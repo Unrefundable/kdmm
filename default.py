@@ -153,6 +153,7 @@ def action_play(params):
     imdb = params.get("imdb", "").strip()
     season = params.get("season", "").strip()
     episode = params.get("episode", "").strip()
+    query_title = (params.get("showtitle") or params.get("title") or "").strip()
     force_refresh = params.get("refresh", "0") == "1"
 
     # Determine catalog type and video_id.
@@ -198,7 +199,8 @@ def action_play(params):
         def _fetch():
             try:
                 fetch_result["candidates"] = fetch_all_cached_streams(
-                    catalog_type, video_id, cancel_event=cancel_event)
+                    catalog_type, video_id, cancel_event=cancel_event,
+                    query_title=query_title)
             except PermissionError:
                 fetch_result["needs_auth"] = True
             except Exception as exc:
