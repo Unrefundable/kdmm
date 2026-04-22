@@ -376,6 +376,9 @@ def _fetch_dmm_hashes(imdb_id, media_type="movie", max_size=0, page=0, api_token
     _log(f"Querying DMM hash DB for {imdb_id} ({media_type})")
     s = _get_session()
     resp = s.get(url, timeout=20)
+    if not resp.ok:
+        body = resp.text[:500] if resp.text else "<empty>"
+        _log(f"DMM {endpoint} error {resp.status_code}: {body}", xbmc.LOGERROR)
     resp.raise_for_status()
     data = resp.json()
     results = data.get("results") or []
@@ -478,6 +481,7 @@ def _try_resolve_one(candidate, api_token, season, episode, cancel_event):
 
     h8 = candidate['hash'][:8]
     rd_id = None
+    ep_link_idx = 0  # which link index to unrestrict (used for cached season packs)
     try:
         if _cancelled(cancel_event):
             return None
@@ -511,7 +515,17 @@ def _try_resolve_one(candidate, api_token, season, episode, cancel_event):
             return None
 
         if status == "downloaded":
-            pass  # already cached, fall through to links
+            # Season pack already cached: find the right link for this episode.
+            # RD returns files and links in the same order (selected files only).
+            if ep_markers:
+                files = info.get("files") or []
+                selected = [f for f in files if f.get("selected") == 1]
+                for idx, f in enumerate(selected):
+                    fname = f.get("path", "").lower()
+                    if any(m in fname for m in ep_markers):
+                        ep_link_idx = idx
+                        _log(f"{h8} season pack: using link[{idx}] for {ep_markers[0]}")
+                        break
         elif status == "waiting_files_selection":
             files = info.get("files") or []
             best_file_id = None
@@ -567,8 +581,9 @@ def _try_resolve_one(candidate, api_token, season, episode, cancel_event):
             _rd_delete(f"/torrents/delete/{rd_id}", api_token)
             return None
 
+        link_to_use = links[min(ep_link_idx, len(links) - 1)]
         unrestrict = _rd_post("/unrestrict/link", api_token,
-                               data={"link": links[0]})
+                               data={"link": link_to_use})
         url = unrestrict.get("download")
         filename = unrestrict.get("filename", candidate.get("title", "Stream"))
         _rd_delete(f"/torrents/delete/{rd_id}", api_token)
@@ -766,11 +781,8 @@ def fetch_all_cached_streams(catalog_type, video_id, cancel_event=None):
     """
     api_token = _rd_key()
     if not api_token:
-        xbmcgui.Dialog().notification(
-            "KDMM",
-            "No Real-Debrid API token – enter your API key in addon settings",
-            xbmcgui.NOTIFICATION_ERROR, 8000)
-        return []
+        _log("No RD access token — authorization required", xbmc.LOGWARNING)
+        raise PermissionError("no_rd_token")
 
     # Parse video_id: for series it's "imdb:season:episode"
     parts = video_id.split(":")

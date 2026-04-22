@@ -29,27 +29,42 @@ def _log(msg, level=xbmc.LOGINFO):
 
 
 def _tokens_path():
-    """Path to the persistent tokens JSON file (in userdata, not addon dir)."""
-    userdata = xbmcvfs.translatePath(f"special://profile/addon_data/{_ADDON_ID}/")
-    os.makedirs(userdata, exist_ok=True)
-    return os.path.join(userdata, "rd_tokens.json")
+    """Virtual path to the persistent tokens JSON file.
+    Uses special:// so xbmcvfs handles Android storage paths correctly.
+    """
+    return f"special://profile/addon_data/{_ADDON_ID}/rd_tokens.json"
 
 
 def _load_tokens():
-    """Load tokens dict from JSON file, or empty dict if missing/corrupt."""
+    """Load tokens dict from JSON file via xbmcvfs, or empty dict if missing/corrupt."""
     try:
-        with open(_tokens_path(), "r") as f:
-            return json.load(f)
-    except Exception:
+        path = _tokens_path()
+        if not xbmcvfs.exists(path):
+            return {}
+        f = xbmcvfs.File(path)
+        content = f.read()
+        f.close()
+        return json.loads(content.decode("utf-8") if isinstance(content, bytes) else content)
+    except Exception as exc:
+        _log(f"Failed to load tokens: {exc}", xbmc.LOGWARNING)
         return {}
 
 
 def _write_tokens(data):
-    """Write tokens dict to JSON file."""
+    """Write tokens dict to JSON file via xbmcvfs (Android-safe)."""
     try:
-        with open(_tokens_path(), "w") as f:
-            json.dump(data, f)
-        _log("Tokens saved to rd_tokens.json")
+        # Ensure directory exists using xbmcvfs so Android storage is handled correctly
+        dir_path = f"special://profile/addon_data/{_ADDON_ID}/"
+        if not xbmcvfs.exists(dir_path):
+            xbmcvfs.mkdirs(dir_path)
+        f = xbmcvfs.File(_tokens_path(), "w")
+        payload = json.dumps(data).encode("utf-8")
+        ok = f.write(payload)
+        f.close()
+        if ok:
+            _log("Tokens saved to rd_tokens.json")
+        else:
+            _log("xbmcvfs write returned False — tokens may not have saved", xbmc.LOGERROR)
     except Exception as exc:
         _log(f"Failed to save tokens: {exc}", xbmc.LOGERROR)
 
@@ -347,6 +362,11 @@ def refresh_token():
         data = resp.json()
     except Exception as exc:
         _log(f"Token refresh failed: {exc}", xbmc.LOGERROR)
+        # 400/401 means the refresh token is invalid/revoked — clear it so we
+        # don’t keep trying. User will need to re-authorize.
+        if _is_token_expired_error(exc):
+            _log("Clearing invalid tokens — re-authorization required", xbmc.LOGWARNING)
+            _write_tokens({})
         return None
 
     new_token = data.get("access_token", "")
@@ -357,6 +377,11 @@ def refresh_token():
         _write_tokens(tokens)
         _log("Token refreshed successfully")
     return new_token or None
+
+
+def _is_token_expired_error(exc):
+    """Return True if the exception is a 400/401 HTTP error (invalid refresh token)."""
+    return any(code in str(exc) for code in ("400", "401"))
 
 
 def get_access_token():
