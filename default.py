@@ -199,6 +199,8 @@ def action_play(params):
             try:
                 fetch_result["candidates"] = fetch_all_cached_streams(
                     catalog_type, video_id, cancel_event=cancel_event)
+            except PermissionError:
+                fetch_result["needs_auth"] = True
             except Exception as exc:
                 fetch_result["error"] = exc
 
@@ -218,6 +220,48 @@ def action_play(params):
             busy_dialog.update(0, f"Finding best stream{'.' * dots}")
             xbmc.sleep(500)
         busy_dialog.close()
+
+        # Auth token missing or expired — prompt user to re-authorize (must run on main thread)
+        if fetch_result.get("needs_auth"):
+            _log("No RD token – prompting user to re-authorize")
+            if xbmcgui.Dialog().yesno(
+                "KDMM – Authorization Required",
+                "Your Real-Debrid authorization has expired.[CR]"
+                "Authorize now to continue watching?",
+                yeslabel="Authorize (QR code)",
+                nolabel="Cancel",
+            ):
+                if rd_authorize():
+                    # Re-run the fetch now that we have a fresh token
+                    fetch_result.clear()
+                    cancel_event.clear()
+                    t2 = threading.Thread(target=_fetch, daemon=True)
+                    t2.start()
+                    busy_dialog2 = xbmcgui.DialogProgress()
+                    busy_dialog2.create("KDMM", "Finding best stream…")
+                    dots = 0
+                    while t2.is_alive():
+                        if busy_dialog2.iscanceled():
+                            cancel_event.set()
+                            busy_dialog2.close()
+                            xbmcplugin.setResolvedUrl(ADDON_HANDLE, False, xbmcgui.ListItem())
+                            return
+                        dots = (dots + 1) % 4
+                        busy_dialog2.update(0, f"Finding best stream{'.' * dots}")
+                        xbmc.sleep(500)
+                    busy_dialog2.close()
+                else:
+                    xbmcplugin.setResolvedUrl(ADDON_HANDLE, False, xbmcgui.ListItem())
+                    return
+            else:
+                xbmcplugin.setResolvedUrl(ADDON_HANDLE, False, xbmcgui.ListItem())
+                return
+            if fetch_result.get("needs_auth"):
+                xbmcgui.Dialog().notification(
+                    "KDMM", "Still no token after re-auth. Check addon settings.",
+                    xbmcgui.NOTIFICATION_ERROR, 8000)
+                xbmcplugin.setResolvedUrl(ADDON_HANDLE, False, xbmcgui.ListItem())
+                return
 
         if "error" in fetch_result:
             _log(f"fetch_all_cached_streams raised: {fetch_result['error']}", xbmc.LOGERROR)
