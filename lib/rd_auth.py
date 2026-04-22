@@ -36,35 +36,33 @@ def _tokens_path():
 
 
 def _load_tokens():
-    """Load tokens dict from JSON file via xbmcvfs, or empty dict if missing/corrupt."""
+    """Load tokens dict from JSON file, or empty dict if missing/corrupt."""
     try:
         path = _tokens_path()
         if not xbmcvfs.exists(path):
             return {}
-        f = xbmcvfs.File(path)
-        content = f.read()
-        f.close()
-        return json.loads(content.decode("utf-8") if isinstance(content, bytes) else content)
+        real_path = xbmcvfs.translatePath(path)
+        with open(real_path, "r", encoding="utf-8") as f:
+            return json.load(f)
     except Exception as exc:
         _log(f"Failed to load tokens: {exc}", xbmc.LOGWARNING)
         return {}
 
 
 def _write_tokens(data):
-    """Write tokens dict to JSON file via xbmcvfs (Android-safe)."""
+    """Write tokens dict to JSON file (Android-safe via translatePath + native open)."""
     try:
-        # Ensure directory exists using xbmcvfs so Android storage is handled correctly
+        # Ensure directory exists via xbmcvfs (handles special:// correctly)
         dir_path = f"special://profile/addon_data/{_ADDON_ID}/"
         if not xbmcvfs.exists(dir_path):
             xbmcvfs.mkdirs(dir_path)
-        f = xbmcvfs.File(_tokens_path(), "w")
-        payload = json.dumps(data).encode("utf-8")
-        ok = f.write(payload)
-        f.close()
-        if ok:
-            _log("Tokens saved to rd_tokens.json")
-        else:
-            _log("xbmcvfs write returned False — tokens may not have saved", xbmc.LOGERROR)
+        # Translate to real filesystem path, then use native open for reliable I/O.
+        # xbmcvfs.File.write() only accepts bytearray (not bytes) so it silently
+        # writes 0 bytes on Android when given a bytes object — causing auth loss.
+        real_path = xbmcvfs.translatePath(_tokens_path())
+        with open(real_path, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        _log(f"Tokens saved to {real_path}")
     except Exception as exc:
         _log(f"Failed to save tokens: {exc}", xbmc.LOGERROR)
 
@@ -327,7 +325,7 @@ def _save_tokens(client_id, client_secret, token_data):
         "client_secret": client_secret,
         "access_token": token_data.get("access_token", ""),
         "refresh_token": token_data.get("refresh_token", ""),
-        "expiry": int(time.time()) + token_data.get("expires_in", 0),
+        "expiry": int(time.time()) + (token_data.get("expires_in") or 3600),
     })
 
 
