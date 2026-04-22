@@ -836,6 +836,27 @@ def fetch_all_cached_streams(catalog_type, video_id, cancel_event=None):
             xbmcgui.NOTIFICATION_WARNING, 5000)
         return []
 
+    # For TV shows, filter out results that don't match the expected season.
+    # DMM's hash DB can include unrelated content whose title happens to share
+    # a keyword with the show name (e.g. "Spiral: From the Book of Saw" mixed
+    # into results for the show "FROM").  Only keep entries whose title contains
+    # the season tag (s01, season 1, etc.); fall back to unfiltered if nothing
+    # survives (safety net for unusual naming schemes).
+    if catalog_type != "movie" and season:
+        s_num = int(season)
+        season_patterns = [f"s{s_num:02d}", f"season {s_num}", f"season{s_num}"]
+        filtered = [
+            r for r in dmm_results
+            if any(p in (r.get("title") or "").lower() for p in season_patterns)
+        ]
+        if filtered:
+            _log(f"Season filter: {len(dmm_results)} → {len(filtered)} results "
+                 f"matching season {s_num} patterns {season_patterns}")
+            dmm_results = filtered
+        else:
+            _log(f"Season filter would remove all {len(dmm_results)} results — "
+                 f"skipping filter (unusual naming)", xbmc.LOGWARNING)
+
     # Build hash → result map
     hash_map = {}
     for r in dmm_results:
