@@ -59,23 +59,36 @@ def _install_player_json():
     )
     dst = os.path.join(dst_dir, "kdmm.json")
 
-    if not os.path.isfile(src):
+    if not xbmcvfs.exists(src):
         return
 
-    with open(src, "r", encoding="utf-8") as f:
+    try:
+        f = xbmcvfs.File(src)
         src_content = f.read()
+        f.close()
+    except Exception as exc:
+        xbmc.log(f"[KDMM Service] Could not read player JSON src: {exc}", xbmc.LOGWARNING)
+        return
 
-    if os.path.isfile(dst):
-        with open(dst, "r", encoding="utf-8") as f:
-            if f.read() == src_content:
+    if xbmcvfs.exists(dst):
+        try:
+            f = xbmcvfs.File(dst)
+            dst_content = f.read()
+            f.close()
+            if dst_content == src_content:
                 return
+        except Exception:
+            pass
 
     xbmcvfs.mkdirs(dst_dir)
 
-    with open(dst, "w", encoding="utf-8") as f:
+    try:
+        f = xbmcvfs.File(dst, "w")
         f.write(src_content)
-
-    xbmc.log("[KDMM Service] Installed player JSON to TMDb Bingie Helper players folder", xbmc.LOGINFO)
+        f.close()
+        xbmc.log("[KDMM Service] Installed player JSON to TMDb Bingie Helper players folder", xbmc.LOGINFO)
+    except Exception as exc:
+        xbmc.log(f"[KDMM Service] Could not write player JSON: {exc}", xbmc.LOGWARNING)
 
 
 # ------------------------------------------------------------------ #
@@ -302,7 +315,10 @@ class BridgeMonitor(xbmc.Monitor):
 
     def run(self):
         _log("Service started")
-        _install_player_json()
+        try:
+            _install_player_json()
+        except Exception as exc:
+            _log(f"_install_player_json failed: {exc}", xbmc.LOGWARNING)
         while not self.abortRequested():
             self.player.tick()
             self.waitForAbort(5)
