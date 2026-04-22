@@ -14,11 +14,13 @@ Flow:
       (RD's instantAvailability endpoint is permanently disabled.)
 """
 
+import html
 import math
 import re
 import sys
 import os
 import time as _time
+import unicodedata
 
 import xbmc
 import xbmcaddon
@@ -59,6 +61,21 @@ _SRC_BLURAY = 1   # BluRay encode (not remux)
 _SRC_WEB = 2      # WEB-DL / WEBRip
 _SRC_HDTV = 3
 _SRC_OTHER = 4
+
+_GENERIC_PRE_TITLE_TOKENS = {
+    "the", "a", "an", "complete", "collection", "series", "season",
+    "show", "tv", "all",
+}
+
+_RELEASE_CONTEXT_TOKENS = {
+    "complete", "season", "series", "episode", "ep", "pack", "multi",
+    "proper", "repack", "remastered", "remaster", "extended", "uncut",
+    "imax", "criterion", "hdr", "hdr10", "dv", "dovi", "sdr", "uhd",
+    "4k", "2160p", "1080p", "720p", "480p", "web", "webrip", "webdl",
+    "bluray", "bdrip", "remux", "hdtv", "nf", "amzn", "atvp", "dsnp",
+    "hmax", "dd", "ddp", "aac", "ac3", "hevc", "x264", "x265", "h264",
+    "h265", "av1",
+}
 
 
 def _parse_title(title):
@@ -114,6 +131,213 @@ def _parse_title(title):
         "src": src,
         "group": group,
     }
+
+
+def _normalize_text(text):
+    text = html.unescape(text or "")
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    return text.lower()
+
+
+def _tokenize_text(text):
+    return re.findall(r"[a-z0-9]+", _normalize_text(text))
+
+
+def _find_token_sequence(haystack, needle):
+    if not haystack or not needle or len(needle) > len(haystack):
+        return []
+    matches = []
+    width = len(needle)
+    for idx in range(0, len(haystack) - width + 1):
+        if haystack[idx:idx + width] == needle:
+            matches.append(idx)
+    return matches
+
+
+def _is_year_token(token):
+    return len(token) == 4 and token.isdigit() and token.startswith(("19", "20"))
+
+
+def _looks_like_release_token(token):
+    if not token:
+        return True
+    if token in _RELEASE_CONTEXT_TOKENS:
+        return True
+    if _is_year_token(token) or token.isdigit():
+        return True
+    if re.match(r"^s\d{1,2}(?:e\d{1,3})?$", token):
+        return True
+    if re.match(r"^\d{1,2}x\d{1,3}$", token):
+        return True
+    if re.match(r"^\d{3,4}p$", token):
+        return True
+    return False
+
+
+def _title_sequence_rank(title, expected_title):
+    """
+    Return a rank tuple for how well the torrent title matches the requested
+    show title, or None when the match is too weak to trust.
+
+    One-word titles like "FROM" are treated specially: the token must look
+    like the actual release title, not just appear inside another title such
+    as "From Scratch" or "Wind Blows From Longxi".
+    """
+    query_tokens = _tokenize_text(expected_title)
+    if not query_tokens:
+        return (1, 99)
+
+    title_tokens = _tokenize_text(title)
+    positions = _find_token_sequence(title_tokens, query_tokens)
+    if not positions:
+        return None
+
+    best_rank = None
+    single_token_title = len(query_tokens) == 1
+    for start in positions:
+        end = start + len(query_tokens)
+        prev_token = title_tokens[start - 1] if start > 0 else ""
+        next_token = title_tokens[end] if end < len(title_tokens) else ""
+
+        if single_token_title:
+            prev_ok = start == 0 or prev_token in _GENERIC_PRE_TITLE_TOKENS or _is_year_token(prev_token)
+            next_ok = _looks_like_release_token(next_token)
+            if not (prev_ok and next_ok):
+                continue
+            boundary_rank = 0 if start == 0 else 1
+        else:
+            if start == 0:
+                boundary_rank = 0
+            elif prev_token in _GENERIC_PRE_TITLE_TOKENS or _is_year_token(prev_token):
+                boundary_rank = 1
+            else:
+                boundary_rank = 2
+
+        rank = (boundary_rank, min(start, 99))
+        if best_rank is None or rank < best_rank:
+            best_rank = rank
+
+    return best_rank
+
+
+def _season_match_rank(title, season):
+    """0 = requested season present, 1 = no explicit season, 2 = conflicting season."""
+    if not season:
+        return 1
+
+    text = _normalize_text(title)
+    season_num = int(season)
+    season_hits = set()
+
+    for value in re.findall(r"\bs0*(\d{1,2})(?:e\d{1,3})?\b", text):
+        season_hits.add(int(value))
+    for value, _ in re.findall(r"\b(\d{1,2})x(\d{1,3})\b", text):
+        season_hits.add(int(value))
+    for value in re.findall(r"\bseason[ ._-]*0*(\d{1,2})\b", text):
+        season_hits.add(int(value))
+    for value in re.findall(r"\bseries[ ._-]*0*(\d{1,2})\b", text):
+        season_hits.add(int(value))
+
+    if season_num in season_hits:
+        return 0
+    if season_hits:
+        return 2
+    return 1
+
+
+def _episode_match_rank(title, season, episode):
+    """0 = requested episode present, 1 = no explicit episode, 2 = conflicting episode."""
+    if not season or not episode:
+        return 1
+
+    text = _normalize_text(title)
+    season_num = int(season)
+    episode_num = int(episode)
+    exact_patterns = [
+        rf"\bs0*{season_num}[ ._-]*e0*{episode_num}\b",
+        rf"\b{season_num}x0*{episode_num}\b",
+        rf"\bepisode[ ._-]*0*{episode_num}\b",
+        rf"\bep[ ._-]*0*{episode_num}\b",
+        rf"\be0*{episode_num}\b",
+    ]
+    if any(re.search(pattern, text) for pattern in exact_patterns):
+        return 0
+
+    season_episode_hits = set()
+    for value_season, value_episode in re.findall(r"\bs0*(\d{1,2})[ ._-]*e0*(\d{1,3})\b", text):
+        if int(value_season) == season_num:
+            season_episode_hits.add(int(value_episode))
+    for value_season, value_episode in re.findall(r"\b(\d{1,2})x(\d{1,3})\b", text):
+        if int(value_season) == season_num:
+            season_episode_hits.add(int(value_episode))
+
+    if season_episode_hits and episode_num not in season_episode_hits:
+        return 2
+    return 1
+
+
+def _filter_tv_results(results, show_title, season, episode):
+    """
+    Progressively tighten noisy DMM TV results.
+
+    Stage 1 keeps only titles that plausibly match the requested show title.
+    Stage 2 rejects explicit conflicting seasons.
+    Stage 3 rejects explicit conflicting episodes.
+
+    Each stage falls back to the previous list if it would remove everything,
+    which keeps unusual foreign/localized naming schemes playable.
+    """
+    filtered = list(results)
+
+    if show_title:
+        title_matches = [
+            result for result in filtered
+            if _title_sequence_rank(result.get("title", ""), show_title) is not None
+        ]
+        if title_matches:
+            _log(f"TV title filter: {len(filtered)} -> {len(title_matches)} results matching {show_title!r}")
+            filtered = title_matches
+        else:
+            _log(f"TV title filter removed all {len(filtered)} results for {show_title!r} - keeping broader set",
+                 xbmc.LOGWARNING)
+
+    if season:
+        season_matches = [
+            result for result in filtered
+            if _season_match_rank(result.get("title", ""), season) < 2
+        ]
+        if season_matches:
+            _log(f"Season filter: {len(filtered)} -> {len(season_matches)} results for season {int(season)}")
+            filtered = season_matches
+        else:
+            _log(f"Season filter removed all {len(filtered)} results for season {int(season)} - keeping broader set",
+                 xbmc.LOGWARNING)
+
+    if season and episode:
+        episode_matches = [
+            result for result in filtered
+            if _episode_match_rank(result.get("title", ""), season, episode) < 2
+        ]
+        if episode_matches:
+            _log(f"Episode filter: {len(filtered)} -> {len(episode_matches)} results for E{int(episode):02d}")
+            filtered = episode_matches
+        else:
+            _log(f"Episode filter removed all {len(filtered)} results for E{int(episode):02d} - keeping broader set",
+                 xbmc.LOGWARNING)
+
+    return filtered
+
+
+def _build_tv_sort_key(quality_sort_key, show_title, season, episode):
+    def _sort_key(entry):
+        title = entry.get("title") or ""
+        title_rank = _title_sequence_rank(title, show_title) or (9, 99)
+        season_rank = _season_match_rank(title, season)
+        episode_rank = _episode_match_rank(title, season, episode)
+        return title_rank + (episode_rank, season_rank) + quality_sort_key(entry)
+
+    return _sort_key
 
 
 def _get_quality_preferences():
@@ -794,7 +1018,7 @@ def is_stream_accessible(url, headers):
         return True
 
 
-def fetch_all_cached_streams(catalog_type, video_id, cancel_event=None):
+def fetch_all_cached_streams(catalog_type, video_id, cancel_event=None, query_title=None):
     """
     Main entry point.  Queries DMM's hash database, then resolves cached
     streams via RD direct-add.  Returns a sorted list of
@@ -840,26 +1064,8 @@ def fetch_all_cached_streams(catalog_type, video_id, cancel_event=None):
             xbmcgui.NOTIFICATION_WARNING, 5000)
         return []
 
-    # For TV shows, filter out results that don't match the expected season.
-    # DMM's hash DB can include unrelated content whose title happens to share
-    # a keyword with the show name (e.g. "Spiral: From the Book of Saw" mixed
-    # into results for the show "FROM").  Only keep entries whose title contains
-    # the season tag (s01, season 1, etc.); fall back to unfiltered if nothing
-    # survives (safety net for unusual naming schemes).
-    if catalog_type != "movie" and season:
-        s_num = int(season)
-        season_patterns = [f"s{s_num:02d}", f"season {s_num}", f"season{s_num}"]
-        filtered = [
-            r for r in dmm_results
-            if any(p in (r.get("title") or "").lower() for p in season_patterns)
-        ]
-        if filtered:
-            _log(f"Season filter: {len(dmm_results)} → {len(filtered)} results "
-                 f"matching season {s_num} patterns {season_patterns}")
-            dmm_results = filtered
-        else:
-            _log(f"Season filter would remove all {len(dmm_results)} results — "
-                 f"skipping filter (unusual naming)", xbmc.LOGWARNING)
+    if catalog_type != "movie":
+        dmm_results = _filter_tv_results(dmm_results, query_title, season, episode)
 
     # Build hash → result map
     hash_map = {}
@@ -879,13 +1085,22 @@ def fetch_all_cached_streams(catalog_type, video_id, cancel_event=None):
     preferred_groups, hdr_pref, res_pref, src_pref = _get_quality_preferences()
     sort_key = _build_sort_key(preferred_groups, hdr_pref, res_pref, src_pref)
 
-    sorted_dmm = sorted(dmm_results, key=sort_key)
+    if catalog_type != "movie":
+        sorted_dmm = sorted(dmm_results, key=_build_tv_sort_key(sort_key, query_title, season, episode))
+    else:
+        sorted_dmm = sorted(dmm_results, key=sort_key)
 
     # Log the top picks so user can verify ranking
     for i, r in enumerate(sorted_dmm[:5]):
         parsed = _parse_title(r.get("title", ""))
+        extra = ""
+        if catalog_type != "movie":
+            title_rank = _title_sequence_rank(r.get("title", ""), query_title) or (9, 99)
+            episode_rank = _episode_match_rank(r.get("title", ""), season, episode)
+            season_rank = _season_match_rank(r.get("title", ""), season)
+            extra = f" match={title_rank} ep={episode_rank} season={season_rank}"
         _log(f"  #{i+1}: {r.get('title','?')[:80]} "
-             f"[hdr={parsed['hdr']} res={parsed['res']} src={parsed['src']} grp={parsed['group']}]")
+             f"[hdr={parsed['hdr']} res={parsed['res']} src={parsed['src']} grp={parsed['group']}{extra}]")
 
     candidates = [
         {"hash": (r.get("hash") or "").lower(), "title": r.get("title", "Unknown")}
