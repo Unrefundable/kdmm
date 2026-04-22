@@ -32,6 +32,9 @@ _RD_BASE = "https://api.real-debrid.com/rest/1.0"
 # Minimum file size to distinguish real content from RD error clips.
 _MIN_STREAM_BYTES = 50 * 1024 * 1024  # 50 MB
 
+# Sentinel returned by _try_resolve_one when RD rejects with 401 (bad token)
+_RD_AUTH_FAILURE = object()
+
 
 # ------------------------------------------------------------------ #
 # Title parser — extract quality metadata from torrent names
@@ -598,6 +601,11 @@ def _try_resolve_one(candidate, api_token, season, episode, cancel_event):
         return None
 
     except Exception as exc:
+        # 401 means the token is invalid/expired — signal this distinctly so
+        # the caller can stop immediately and prompt for re-authorization.
+        if "401" in str(exc):
+            _log(f"{h8} RD 401 – token rejected", xbmc.LOGWARNING)
+            return _RD_AUTH_FAILURE
         _log(f"{h8} failed: {exc}", xbmc.LOGWARNING)
         if rd_id:
             _rd_delete(f"/torrents/delete/{rd_id}", api_token)
@@ -646,7 +654,11 @@ def _resolve_by_direct_add(candidates_info, api_token, season=None, episode=None
         try:
             for future in as_completed(futures):
                 result = future.result()
-                if result:
+                if result is _RD_AUTH_FAILURE:
+                    # Count auth failures; if the whole first batch fails with 401
+                    # the token is bad — abort immediately and signal re-auth needed.
+                    pass  # counted below after batch drains
+                elif result:
                     resolved.append(result)
                     if len(resolved) >= max_resolve:
                         enough_event.set()
@@ -655,12 +667,20 @@ def _resolve_by_direct_add(candidates_info, api_token, season=None, episode=None
                     enough_event.set()
                     break
         finally:
-            # Shut down immediately — do NOT wait for remaining threads.
-            # This is the key fix: without wait=False, the executor blocks
-            # here until all threads finish even though we already have a result.
             for f in futures:
                 f.cancel()
             pool.shutdown(wait=False)
+
+        # If every result in this batch was a 401, the token is rejected — stop now.
+        batch_results = []
+        for f in list(futures.keys()):
+            try:
+                batch_results.append(f.result() if f.done() else None)
+            except Exception:
+                pass
+        if batch_results and all(r is _RD_AUTH_FAILURE for r in batch_results if r is not None):
+            _log("All RD calls returned 401 – token is invalid, raising auth error", xbmc.LOGWARNING)
+            raise PermissionError("rd_token_rejected")
 
         if enough_event.is_set():
             break
