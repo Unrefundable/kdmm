@@ -356,7 +356,7 @@ def _rd_delete(path, api_token, timeout=5):
 # DMM hash database query
 # ------------------------------------------------------------------ #
 
-def _fetch_dmm_hashes(imdb_id, media_type="movie", max_size=0, page=0, api_token=None):
+def _fetch_dmm_hashes(imdb_id, media_type="movie", max_size=0, page=0, api_token=None, season=None):
     """
     Query DMM's torrent database for all known hashes for an IMDB ID.
     Returns list of dicts: [{hash, title, fileSize, files, ...}, ...]
@@ -372,6 +372,10 @@ def _fetch_dmm_hashes(imdb_id, media_type="movie", max_size=0, page=0, api_token
         f"&maxSize={max_size}"
         f"&page={page}"
     )
+    # TV endpoint requires seasonNum — returns 400 without it
+    if endpoint == "tv":
+        season_num = int(season) if season else 1
+        url += f"&seasonNum={season_num}"
 
     _log(f"Querying DMM hash DB for {imdb_id} ({media_type})")
     s = _get_session()
@@ -796,6 +800,7 @@ def fetch_all_cached_streams(catalog_type, video_id, cancel_event=None):
             imdb_id,
             media_type="movie" if catalog_type == "movie" else "tv",
             api_token=api_token,
+            season=season,
         )
     except Exception as exc:
         _log(f"DMM hash fetch failed: {exc}", xbmc.LOGERROR)
