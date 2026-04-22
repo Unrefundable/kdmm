@@ -672,13 +672,17 @@ def _resolve_by_direct_add(candidates_info, api_token, season=None, episode=None
             pool.shutdown(wait=False)
 
         # If every result in this batch was a 401, the token is rejected — stop now.
+        # IMPORTANT: use 'non_none' guard to avoid vacuous truth — all(empty) is True in
+        # Python, so a batch where every candidate was simply not cached (all None) would
+        # incorrectly trigger auth failure without this check.
         batch_results = []
         for f in list(futures.keys()):
             try:
                 batch_results.append(f.result() if f.done() else None)
             except Exception:
                 pass
-        if batch_results and all(r is _RD_AUTH_FAILURE for r in batch_results if r is not None):
+        non_none = [r for r in batch_results if r is not None]
+        if non_none and all(r is _RD_AUTH_FAILURE for r in non_none):
             _log("All RD calls returned 401 – token is invalid, raising auth error", xbmc.LOGWARNING)
             raise PermissionError("rd_token_rejected")
 
