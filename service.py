@@ -1,28 +1,6 @@
-"""
-KDMM – service.py
-Background service that runs for the lifetime of Kodi.
+"""KDMM service: resume, retry, and IntroDB-backed skip/next overlays."""
 
-Responsibilities
-────────────────
-1. RESUME-SEEK
-   When the bridge plugin resolves a stream it sets two global window
-   properties before calling setResolvedUrl():
-       kdmm.media_id    – e.g. "tt1234567" or "tt1234567:1:2"
-       kdmm.resume_time – float seconds (only when > 5.0)
-
-   BridgePlayer.onAVStarted() reads these properties, clears them, and
-   calls seekTime() so the video starts at the correct position.
-
-2. PROGRESS TRACKING
-   BridgePlayer.onPlayBackStopped() and .onPlayBackEnded() save the
-   current playback time to ProgressCache so KDMM knows where to
-   resume on next play.
-
-3. BROKEN STREAM RECOVERY
-   BridgePlayer.onPlayBackError() clears the cached stream URL for an
-   item so the next play attempt fetches a fresh one from DMM.
-"""
-
+import json
 import os
 import sys
 
@@ -43,7 +21,10 @@ _USERDATA_PATH = xbmcvfs.translatePath(
 sys.path.insert(0, os.path.join(_ADDON_PATH, "lib"))
 
 from cache import StreamCache, ProgressCache   # noqa: E402
+from introdb_client import query_all_segments  # noqa: E402
+from next_episode import get_next_episode, play_next_episode  # noqa: E402
 from playback import apply_playback_metadata, decode_playback_context  # noqa: E402
+from segment_overlay import show_skip_overlay  # noqa: E402
 
 # ------------------------------------------------------------------ #
 # One-time player JSON installer
@@ -103,10 +84,242 @@ PROP_PLAYBACK_CONTEXT = "kdmm.playback_context"
 
 WATCHED_MARGIN_SECONDS = 60
 MIN_CONTENT_SECONDS = 60
+SEGMENT_END_MARGIN_SECONDS = 0.25
+NEXT_EPISODE_FALLBACK_SECONDS = 45
+POST_CREDITS_SCENE_MIN_SECONDS = 20
 
 
 def _log(msg, level=xbmc.LOGINFO):
     xbmc.log(f"[KDMM Service] {msg}", level)
+
+
+def _setting_bool(key, default=False):
+    try:
+        value = xbmcaddon.Addon().getSetting(key)
+    except Exception:
+        value = "true" if default else "false"
+    if value == "":
+        return default
+    return value.lower() == "true"
+
+
+def _setting_int(key, default):
+    try:
+        value = xbmcaddon.Addon().getSetting(key)
+        return int(value) if value not in (None, "") else default
+    except Exception:
+        return default
+
+
+def _should_show_segment_button(processed_segments, segment_key, current_time,
+                                segment_start, segment_end, margin=SEGMENT_END_MARGIN_SECONDS):
+    state = processed_segments.setdefault(segment_key, {
+        "inside": False,
+        "shown_for_entry": False,
+        "last_time": None,
+    })
+
+    inside_segment = segment_start <= current_time < (segment_end - margin)
+    previous_time = state.get("last_time")
+
+    if not inside_segment:
+        state["inside"] = False
+        state["shown_for_entry"] = False
+        state["last_time"] = current_time
+        return False
+
+    reentered = not state["inside"]
+    if previous_time is not None and current_time + margin < previous_time:
+        reentered = True
+
+    if reentered:
+        state["shown_for_entry"] = False
+
+    state["inside"] = True
+    state["last_time"] = current_time
+
+    if state["shown_for_entry"]:
+        return False
+
+    state["shown_for_entry"] = True
+    return True
+
+
+class SegmentController:
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self._current_file = None
+        self._segments = None
+        self._processed = {}
+        self._next_episode = None
+        self._next_episode_checked = False
+        self._next_overlay_shown = False
+
+    def tick(self, player, monitor):
+        if not player.isPlayingVideo() or not player._playback_context:
+            self.reset()
+            return
+
+        filename = player.getPlayingFile() if player.isPlaying() else None
+        if not filename:
+            return
+        filename = filename.split("|")[0]
+
+        if filename != self._current_file:
+            self.reset()
+            self._current_file = filename
+            _log(f"Segment tracking reset for file: {filename}")
+
+        context = player._playback_context or {}
+        current_time = player._last_known_time if player._last_known_time > 0 else self._safe_get_time(player)
+        total_time = player._last_known_total if player._last_known_total > 0 else self._safe_get_total(player)
+        if total_time <= 0:
+            return
+
+        if self._segments is None and _setting_bool("segment_lookups_enabled", True):
+            self._segments = query_all_segments(
+                tmdb_id=context.get("tmdb_id"),
+                imdb_id=context.get("imdb_id"),
+                season=context.get("season"),
+                episode=context.get("episode"),
+                is_movie=context.get("is_movie", False),
+            )
+
+        all_segments = self._build_enabled_segments(self._segments or {})
+
+        for idx, segment in enumerate(all_segments):
+            segment_type = segment["type"]
+            api_start = segment.get("start")
+            api_end = segment.get("end")
+
+            if api_start is None and api_end is None:
+                continue
+            if api_start is None:
+                api_start = 0.0
+            effective_end = total_time if api_end is None else api_end
+            if effective_end <= api_start:
+                continue
+
+            segment_key = f"{segment_type}_{idx}"
+            if not _should_show_segment_button(self._processed, segment_key, current_time, api_start, effective_end):
+                continue
+
+            action_type = segment_type
+            next_episode = None
+            if _setting_bool("enable_next_episode_button", True) and not context.get("is_movie", False):
+                next_episode = self._get_next_episode(context)
+                if next_episode and self._should_use_next_overlay(all_segments, idx, segment_type, api_end, total_time):
+                    action_type = "next_episode"
+                    self._next_overlay_shown = True
+
+            if action_type == "next_episode" and next_episode:
+                pressed = show_skip_overlay(
+                    segment_end=effective_end,
+                    player=player,
+                    monitor=monitor,
+                    segment_type="next_episode",
+                )
+                if pressed:
+                    _log(f"Opening next episode S{next_episode['season']}E{next_episode['episode']}")
+                    play_next_episode(next_episode)
+                continue
+
+            pressed = show_skip_overlay(
+                segment_end=effective_end,
+                player=player,
+                monitor=monitor,
+                segment_type=segment_type,
+            )
+            if pressed:
+                self._seek_past_segment(player, effective_end, segment_type, total_time)
+
+        if _setting_bool("enable_next_episode_button", True) and not context.get("is_movie", False):
+            self._show_fallback_next_episode(player, monitor, context, current_time, total_time)
+
+    def _build_enabled_segments(self, segments):
+        enabled = []
+        mapping = {
+            "intro": "enable_intro_button",
+            "recap": "enable_recap_button",
+            "credits": "enable_credits_button",
+            "preview": "enable_preview_button",
+        }
+        for segment_type in ("intro", "recap", "credits", "preview"):
+            if not _setting_bool(mapping[segment_type], True):
+                continue
+            for segment in segments.get(segment_type, []):
+                item = dict(segment)
+                item["type"] = segment_type
+                enabled.append(item)
+        enabled.sort(key=lambda item: item.get("start") if item.get("start") is not None else 0.0)
+        return enabled
+
+    def _get_next_episode(self, context):
+        if not self._next_episode_checked:
+            self._next_episode = get_next_episode(context)
+            self._next_episode_checked = True
+        return self._next_episode
+
+    def _should_use_next_overlay(self, all_segments, idx, segment_type, api_end, total_time):
+        if segment_type not in ("credits", "preview"):
+            return False
+        later_segments = [
+            seg for seg in all_segments[idx + 1:]
+            if (seg.get("start") or 0) > (all_segments[idx].get("start") or 0)
+        ]
+        if later_segments:
+            return False
+        if api_end is None:
+            return True
+        trailing_content = max(0.0, total_time - api_end)
+        return trailing_content <= POST_CREDITS_SCENE_MIN_SECONDS
+
+    def _seek_past_segment(self, player, segment_end, segment_type, total_time):
+        offset = _setting_int("skip_offset_seconds", 2)
+        target = segment_end + offset
+        if target >= total_time:
+            target = max(0.0, total_time - 10.0)
+        try:
+            _log(f"Skipping {segment_type}: target {target:.1f}s")
+            player.seekTime(target)
+        except Exception as exc:
+            _log(f"seekTime failed for {segment_type}: {exc}", xbmc.LOGWARNING)
+
+    def _show_fallback_next_episode(self, player, monitor, context, current_time, total_time):
+        if self._next_overlay_shown or total_time <= 0:
+            return
+        next_episode = self._get_next_episode(context)
+        if not next_episode:
+            return
+        start = max(0.0, total_time - NEXT_EPISODE_FALLBACK_SECONDS)
+        if not _should_show_segment_button(self._processed, "next_episode_fallback", current_time, start, total_time):
+            return
+        self._next_overlay_shown = True
+        pressed = show_skip_overlay(
+            segment_end=total_time,
+            player=player,
+            monitor=monitor,
+            segment_type="next_episode",
+        )
+        if pressed:
+            _log(f"Opening fallback next episode S{next_episode['season']}E{next_episode['episode']}")
+            play_next_episode(next_episode)
+
+    @staticmethod
+    def _safe_get_time(player):
+        try:
+            return player.getTime()
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def _safe_get_total(player):
+        try:
+            return player.getTotalTime()
+        except Exception:
+            return 0.0
 
 
 # ------------------------------------------------------------------ #
@@ -326,6 +539,7 @@ class BridgeMonitor(xbmc.Monitor):
     def __init__(self):
         super().__init__()
         self.player = BridgePlayer()
+        self.segment_controller = SegmentController()
 
     def run(self):
         _log("Service started")
@@ -335,7 +549,8 @@ class BridgeMonitor(xbmc.Monitor):
             _log(f"_install_player_json failed: {exc}", xbmc.LOGWARNING)
         while not self.abortRequested():
             self.player.tick()
-            self.waitForAbort(5)
+            self.segment_controller.tick(self.player, self)
+            self.waitForAbort(0.5)
         _log("Service stopped")
 
 
