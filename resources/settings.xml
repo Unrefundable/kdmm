@@ -16,6 +16,17 @@
         <setting id="resolution_priority" type="enum" label="Resolution preference" values="4K (2160p)|1080p|720p" default="0"/>
         <setting id="source_priority" type="enum" label="Source preference" values="Remux|BluRay encode|WEB|Any" default="0"/>
     </category>
+    <category label="Skip &amp; Next">
+        <setting id="segment_lookups_enabled" type="bool" label="Use IntroDB timings for skip buttons" default="true"/>
+        <setting id="enable_intro_button" type="bool" label="Show Skip Intro button" default="true"/>
+        <setting id="enable_recap_button" type="bool" label="Show Skip Recap button" default="true"/>
+        <setting id="enable_credits_button" type="bool" label="Show Skip Credits button" default="true"/>
+        <setting id="enable_preview_button" type="bool" label="Show Skip Preview button" default="true"/>
+        <setting id="enable_next_episode_button" type="bool" label="Show Play Next Episode button" default="true"/>
+        <setting id="skip_offset_seconds" type="number" label="Skip offset (seconds)" default="2"/>
+        <setting id="introdb_api_key" type="text" label="IntroDB API key (optional)" default="" option="hidden"/>
+        <setting id="segment_debug_logging" type="bool" label="Verbose IntroDB/skip logging" default="false"/>
+    </category>
     <category label="Cache">
         <setting id="stream_cache_ttl_hours" type="number" label="Stream cache duration (hours)" default="6"/>
         <setting id="notify_cache_hit" type="bool" label="Notify on cache hit" default="false"/>
