@@ -352,7 +352,9 @@ def refresh_token():
                 "client_id": client_id,
                 "client_secret": client_secret,
                 "code": refresh_tok,
-                "grant_type": "refresh_token",
+                # Real-Debrid's device/open-source flow reuses the original
+                # device grant when exchanging a stored refresh token.
+                "grant_type": "http://oauth.net/grant_type/device/1.0",
             },
             timeout=15,
         )
