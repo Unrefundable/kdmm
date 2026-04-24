@@ -49,6 +49,7 @@ sys.path.insert(0, os.path.join(_ADDON_PATH, "lib"))
 
 from cache import StreamCache, ProgressCache        # noqa: E402 (after sys.path)
 from dmm import fetch_all_cached_streams, is_stream_accessible    # noqa: E402
+from playback import apply_playback_metadata, build_playback_context, encode_playback_context  # noqa: E402
 from rd_auth import authorize as rd_authorize, revoke as rd_revoke  # noqa: E402
 
 # ------------------------------------------------------------------ #
@@ -58,6 +59,7 @@ WIN = xbmcgui.Window(10000)
 PROP_MEDIA_ID = "kdmm.media_id"
 PROP_RESUME_TIME = "kdmm.resume_time"
 PROP_CANDIDATES = "kdmm.candidates"   # JSON list of all cached stream candidates
+PROP_PLAYBACK_CONTEXT = "kdmm.playback_context"
 
 
 def _log(msg, level=xbmc.LOGINFO):
@@ -86,7 +88,8 @@ def _build_final_url(url, headers_dict):
     return f"{url}|{formatted}", True
 
 
-def _play_stream(media_id, url, headers_dict, imdb, season, episode, no_resume=False):
+def _play_stream(media_id, url, headers_dict, imdb, tmdb, title, showtitle,
+                 season, episode, year=None, no_resume=False):
     """
     Build the ListItem and resolve it to Kodi via setResolvedUrl.
     """
@@ -94,6 +97,18 @@ def _play_stream(media_id, url, headers_dict, imdb, season, episode, no_resume=F
 
     li = xbmcgui.ListItem(path=final_url)
     li.setProperty("IsPlayable", "true")
+
+    playback_context = build_playback_context(
+        media_id=media_id,
+        imdb=imdb,
+        tmdb=tmdb,
+        title=title,
+        showtitle=showtitle,
+        season=season,
+        episode=episode,
+        year=year,
+    )
+    apply_playback_metadata(li, playback_context)
 
     # Only force inputstream.ffmpegdirect for adaptive / container formats that
     # Kodi's native HTTP player can't handle.
@@ -112,17 +127,11 @@ def _play_stream(media_id, url, headers_dict, imdb, season, episode, no_resume=F
 
     # Tag the item with its IMDB number for Trakt scrobbling.
     if imdb:
-        li.setInfo("video", {"imdbnumber": imdb})
         WIN.setProperty("script.trakt.ids", json.dumps({"imdb": imdb}))
-
-    if season and episode:
-        try:
-            li.setInfo("video", {"season": int(season), "episode": int(episode)})
-        except (TypeError, ValueError):
-            pass
 
     # Tell the service which item is playing so it can save progress later.
     WIN.setProperty(PROP_MEDIA_ID, media_id)
+    WIN.setProperty(PROP_PLAYBACK_CONTEXT, encode_playback_context(playback_context))
 
     # Queue a resume seek via window property; service.py reads it in onAVStarted.
     progress_cache = ProgressCache(_USERDATA_PATH)
@@ -151,9 +160,13 @@ def action_play(params):
     """
     action = params.get("action", "play_movie")
     imdb = params.get("imdb", "").strip()
+    tmdb = params.get("tmdb", "").strip()
     season = params.get("season", "").strip()
     episode = params.get("episode", "").strip()
-    query_title = (params.get("showtitle") or params.get("title") or "").strip()
+    title = params.get("title", "").strip()
+    showtitle = params.get("showtitle", "").strip()
+    year = params.get("year", "").strip()
+    query_title = showtitle or title
     force_refresh = params.get("refresh", "0") == "1"
 
     # Determine catalog type and video_id.
@@ -313,8 +326,12 @@ def action_play(params):
         url=stream["url"],
         headers_dict=stream.get("headers") or {},
         imdb=imdb,
+        tmdb=tmdb,
+        title=title,
+        showtitle=showtitle,
         season=season,
         episode=episode,
+        year=year,
         no_resume=NO_RESUME,
     )
 
