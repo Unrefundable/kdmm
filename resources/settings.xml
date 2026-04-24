@@ -23,6 +23,7 @@
         <setting id="enable_credits_button" type="bool" label="Show Skip Credits button" default="true"/>
         <setting id="enable_preview_button" type="bool" label="Show Skip Preview button" default="true"/>
         <setting id="enable_next_episode_button" type="bool" label="Show Play Next Episode button" default="true"/>
+        <setting id="auto_play_next_episode" type="bool" label="Automatically play next episode when episode ends" default="true"/>
         <setting id="skip_offset_seconds" type="number" label="Skip offset (seconds)" default="2"/>
         <setting id="introdb_api_key" type="text" label="IntroDB API key (optional)" default="" option="hidden"/>
         <setting id="segment_debug_logging" type="bool" label="Verbose IntroDB/skip logging" default="false"/>

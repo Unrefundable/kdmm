@@ -420,7 +420,16 @@ class BridgePlayer(xbmc.Player):
         if not media_id:
             return
 
+        playback_context = dict(self._playback_context or {})
         total_time = self._last_known_total
+        next_episode = None
+        should_auto_next = (
+            is_ended
+            and _setting_bool("auto_play_next_episode", True)
+            and not playback_context.get("is_movie", False)
+        )
+        if should_auto_next:
+            next_episode = get_next_episode(playback_context)
 
         if 0 < total_time < MIN_CONTENT_SECONDS:
             _log(
@@ -434,6 +443,21 @@ class BridgePlayer(xbmc.Player):
             self._try_next_candidate(media_id)
         else:
             self._save_progress(is_ended=is_ended)
+            if next_episode:
+                self._open_next_episode(next_episode)
+
+    def _open_next_episode(self, next_episode):
+        import threading
+
+        def _open():
+            xbmc.sleep(800)
+            _log(
+                f"Auto-playing next episode S{next_episode['season']}E{next_episode['episode']}"
+            )
+            if not play_next_episode(next_episode):
+                _log("Automatic next-episode playback failed", xbmc.LOGWARNING)
+
+        threading.Thread(target=_open, daemon=True).start()
 
     def _try_next_candidate(self, media_id):
         import json, threading
