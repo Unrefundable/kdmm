@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<addon id="plugin.video.kdmm" version="2.6.1" name="KDMM" provider-name="Unrefundable">
+<addon id="plugin.video.kdmm" version="2.6.2" name="KDMM" provider-name="Unrefundable">
     <requires>
         <import addon="xbmc.python" version="3.0.0"/>
         <import addon="script.module.requests" version="2.9.1"/>
@@ -17,8 +17,9 @@
             Queries Debrid Media Manager's torrent database, checks Real-Debrid
             for cached availability, resolves a direct-play URL, and plays it in
             the Bingie skin via TMDb Bingie Helper. Supports auto-play, resume
-            from last position, preferred release group sorting, and IntroDB-
-            powered skip intro/recap/credits/preview plus next-episode overlays.
+            from last position, preferred release group sorting, and IntroDB.app
+            plus TheIntroDB-backed skip intro/recap/credits/preview with next-
+            episode overlays.
         </description>
         <platform>all</platform>
     </extension>

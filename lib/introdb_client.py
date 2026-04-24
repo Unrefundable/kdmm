@@ -12,7 +12,8 @@ except ImportError:
 
 
 ADDON = xbmcaddon.Addon()
-API_BASE = "https://api.theintrodb.org/v2"
+THEINTRODB_API_BASE = "https://api.theintrodb.org/v2"
+INTRODB_API_BASE = "https://api.introdb.app"
 MIN_REQUEST_GAP = 0.4
 SEGMENT_TYPES = ("intro", "recap", "credits", "preview")
 
@@ -111,32 +112,77 @@ def _episode_nums(season, episode):
         return None, None
 
 
-def _build_candidate_urls(tmdb_id, imdb_id, season, episode, is_movie):
+def _build_theintrodb_urls(tmdb_id, imdb_id, season, episode, is_movie):
     urls = []
     if tmdb_id and _valid_tmdb(tmdb_id):
         tid = str(tmdb_id).strip()
         if is_movie:
-            urls.append((f"{API_BASE}/media?tmdb_id={tid}", "tmdb"))
+            urls.append((f"{THEINTRODB_API_BASE}/media?tmdb_id={tid}", "theintrodb:tmdb"))
         else:
             season_num, episode_num = _episode_nums(season, episode)
             if season_num and episode_num:
                 urls.append((
-                    f"{API_BASE}/media?tmdb_id={tid}&season={season_num}&episode={episode_num}",
-                    "tmdb",
+                    f"{THEINTRODB_API_BASE}/media?tmdb_id={tid}&season={season_num}&episode={episode_num}",
+                    "theintrodb:tmdb",
                 ))
 
     imdb = _normalize_imdb(imdb_id)
     if imdb:
         if is_movie:
-            urls.append((f"{API_BASE}/media?imdb_id={imdb}", "imdb"))
+            urls.append((f"{THEINTRODB_API_BASE}/media?imdb_id={imdb}", "theintrodb:imdb"))
         else:
             season_num, episode_num = _episode_nums(season, episode)
             if season_num and episode_num:
                 urls.append((
-                    f"{API_BASE}/media?imdb_id={imdb}&season={season_num}&episode={episode_num}",
-                    "imdb",
+                    f"{THEINTRODB_API_BASE}/media?imdb_id={imdb}&season={season_num}&episode={episode_num}",
+                    "theintrodb:imdb",
                 ))
     return urls
+
+
+def _build_introdb_url(imdb_id, season, episode, is_movie):
+    if is_movie:
+        return None
+    imdb = _normalize_imdb(imdb_id)
+    season_num, episode_num = _episode_nums(season, episode)
+    if not imdb or not season_num or not episode_num:
+        return None
+    return f"{INTRODB_API_BASE}/segments?imdb_id={imdb}&season={season_num}&episode={episode_num}"
+
+
+def _normalize_segment_payload(segment):
+    if not isinstance(segment, dict):
+        return []
+    start_ms = segment.get("start_ms")
+    end_ms = segment.get("end_ms")
+    if start_ms is None and segment.get("start_sec") is not None:
+        try:
+            start_ms = int(float(segment.get("start_sec")) * 1000.0)
+        except (TypeError, ValueError):
+            start_ms = None
+    if end_ms is None and segment.get("end_sec") is not None:
+        try:
+            end_ms = int(float(segment.get("end_sec")) * 1000.0)
+        except (TypeError, ValueError):
+            end_ms = None
+    normalized = dict(segment)
+    normalized["start_ms"] = start_ms
+    normalized["end_ms"] = end_ms
+    return [normalized]
+
+
+def _merge_source_payload(merged, data, source):
+    if not isinstance(data, dict):
+        return
+
+    if source == "introdb":
+        merged["intro"].extend(_normalize_segment_payload(data.get("intro")))
+        merged["recap"].extend(_normalize_segment_payload(data.get("recap")))
+        merged["credits"].extend(_normalize_segment_payload(data.get("outro")))
+        return
+
+    for segment_type in SEGMENT_TYPES:
+        merged[segment_type].extend(data.get(segment_type, []) or [])
 
 
 def _pick_best_segments_all_types(segments, segment_type):
@@ -194,7 +240,11 @@ def query_all_segments(tmdb_id=None, imdb_id=None, season=None, episode=None, is
     if ADDON.getSetting("segment_lookups_enabled") != "true":
         return {}
 
-    urls = _build_candidate_urls(tmdb_id, imdb_id, season, episode, is_movie)
+    urls = _build_theintrodb_urls(tmdb_id, imdb_id, season, episode, is_movie)
+    introdb_url = _build_introdb_url(imdb_id, season, episode, is_movie)
+    if introdb_url:
+        urls.append((introdb_url, "introdb"))
+
     if not urls:
         _log("No TMDb/IMDb identifiers available for segment lookup")
         return {}
@@ -209,8 +259,7 @@ def query_all_segments(tmdb_id=None, imdb_id=None, season=None, episode=None, is
         data = _do_request(url, api_key)
         if not data:
             continue
-        for segment_type in SEGMENT_TYPES:
-            merged[segment_type].extend(data.get(segment_type, []) or [])
+        _merge_source_payload(merged, data, mode)
 
     results = {}
     for segment_type in SEGMENT_TYPES:

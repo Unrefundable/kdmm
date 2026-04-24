@@ -17,7 +17,7 @@
         <setting id="source_priority" type="enum" label="Source preference" values="Remux|BluRay encode|WEB|Any" default="0"/>
     </category>
     <category label="Skip &amp; Next">
-        <setting id="segment_lookups_enabled" type="bool" label="Use IntroDB timings for skip buttons" default="true"/>
+        <setting id="segment_lookups_enabled" type="bool" label="Use IntroDB.app and TheIntroDB timings" default="true"/>
         <setting id="enable_intro_button" type="bool" label="Show Skip Intro button" default="true"/>
         <setting id="enable_recap_button" type="bool" label="Show Skip Recap button" default="true"/>
         <setting id="enable_credits_button" type="bool" label="Show Skip Credits button" default="true"/>
