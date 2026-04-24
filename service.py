@@ -43,6 +43,7 @@ _USERDATA_PATH = xbmcvfs.translatePath(
 sys.path.insert(0, os.path.join(_ADDON_PATH, "lib"))
 
 from cache import StreamCache, ProgressCache   # noqa: E402
+from playback import apply_playback_metadata, decode_playback_context  # noqa: E402
 
 # ------------------------------------------------------------------ #
 # One-time player JSON installer
@@ -98,6 +99,7 @@ WIN = xbmcgui.Window(10000)
 PROP_MEDIA_ID = "kdmm.media_id"
 PROP_RESUME_TIME = "kdmm.resume_time"
 PROP_CANDIDATES = "kdmm.candidates"
+PROP_PLAYBACK_CONTEXT = "kdmm.playback_context"
 
 WATCHED_MARGIN_SECONDS = 60
 MIN_CONTENT_SECONDS = 60
@@ -121,6 +123,7 @@ class BridgePlayer(xbmc.Player):
         self._tried_urls = set()
         self._stream_cache = StreamCache(_USERDATA_PATH)
         self._progress_cache = ProgressCache(_USERDATA_PATH)
+        self._playback_context = {}
 
     def tick(self):
         if self._current_media_id and self.isPlaying():
@@ -144,6 +147,9 @@ class BridgePlayer(xbmc.Player):
         self._last_known_total = 0.0
         self._tried_urls = set()
         self._current_url = None
+        self._playback_context = decode_playback_context(
+            WIN.getProperty(PROP_PLAYBACK_CONTEXT)
+        )
         try:
             self._current_url = self.getPlayingFile().split("|")[0]
         except Exception:
@@ -248,6 +254,8 @@ class BridgePlayer(xbmc.Player):
             )
             self._stream_cache.clear(media_id)
             WIN.clearProperty(PROP_CANDIDATES)
+            WIN.clearProperty(PROP_PLAYBACK_CONTEXT)
+            self._playback_context = {}
             xbmcgui.Dialog().notification(
                 "KDMM",
                 "All available streams failed – cache cleared, please try again",
@@ -268,6 +276,10 @@ class BridgePlayer(xbmc.Player):
 
             li = xbmcgui.ListItem(path=final_url)
             li.setProperty("IsPlayable", "true")
+            apply_playback_metadata(
+                li,
+                self._playback_context or decode_playback_context(WIN.getProperty(PROP_PLAYBACK_CONTEXT)),
+            )
             if headers:
                 li.setProperty("inputstream", "inputstream.ffmpegdirect")
 
@@ -283,6 +295,8 @@ class BridgePlayer(xbmc.Player):
         if not media_id:
             return
         self._current_media_id = None
+        WIN.clearProperty(PROP_PLAYBACK_CONTEXT)
+        self._playback_context = {}
 
         current_time = self._last_known_time
         total_time = self._last_known_total
