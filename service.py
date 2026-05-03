@@ -20,7 +20,7 @@ _USERDATA_PATH = xbmcvfs.translatePath(
 )
 sys.path.insert(0, os.path.join(_ADDON_PATH, "lib"))
 
-from cache import StreamCache, ProgressCache   # noqa: E402
+from cache import StreamCache, ProgressCache, PackBindingCache   # noqa: E402
 from introdb_client import query_all_segments  # noqa: E402
 from next_episode import get_next_episode, play_next_episode  # noqa: E402
 from playback import apply_playback_metadata, decode_playback_context  # noqa: E402
@@ -490,6 +490,9 @@ class BridgePlayer(xbmc.Player):
                 xbmc.LOGWARNING,
             )
             self._stream_cache.clear(media_id)
+            if media_id and media_id.count(":") >= 2:
+                imdb_id, season, _episode = media_id.split(":", 2)
+                PackBindingCache(_USERDATA_PATH).clear(imdb_id, season)
             WIN.clearProperty(PROP_CANDIDATES)
             WIN.clearProperty(PROP_PLAYBACK_CONTEXT)
             self._playback_context = {}
