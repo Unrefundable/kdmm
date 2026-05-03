@@ -3,9 +3,15 @@
 # Output: ./release/addons.xml, ./release/addons.xml.md5,
 #         ./release/plugin.video.kdmm/plugin.video.kdmm-<version>.zip
 #
-# After running, publish the contents of ./release/ to the gh-pages branch
-# (root of the site), e.g.:
-#   git checkout gh-pages && rsync -a --delete ../release/ ./ && git add -A && git commit -m "Publish KDMM" && git push
+# GitHub Pages for this repo is served from the main branch /docs folder.
+# After running, copy ./release/ into docs/ (keep docs/index.html, repo zip, etc.):
+#   cp -f release/addons.xml release/addons.xml.md5 docs/
+#   mkdir -p docs/plugin.video.kdmm
+#   cp -f release/plugin.video.kdmm/plugin.video.kdmm-*.zip docs/plugin.video.kdmm/
+#   : > docs/.nojekyll   # required so GitHub Pages serves .zip files (not 404)
+#
+# Optional: sync ./release/ to orphan branch gh-pages instead (use rsync
+# --exclude='.git/' when cloning into a repo).
 
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -27,6 +33,8 @@ OUT="$ROOT/release"
 STAGING="$ROOT/.staging_addon_zip"
 rm -rf "$OUT" "$STAGING"
 mkdir -p "$OUT/plugin.video.kdmm" "$STAGING/plugin.video.kdmm"
+# Bypass Jekyll on GitHub Pages so .zip and other assets are served (not 404).
+: > "$OUT/.nojekyll"
 
 rsync -a \
   --exclude='.git/' \
