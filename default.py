@@ -47,7 +47,7 @@ ADDON_HANDLE = int(sys.argv[1]) if len(sys.argv) > 1 else -1
 NO_RESUME = len(sys.argv) > 3 and "resume:false" in sys.argv[3].lower()
 sys.path.insert(0, os.path.join(_ADDON_PATH, "lib"))
 
-from cache import StreamCache, ProgressCache        # noqa: E402 (after sys.path)
+from cache import StreamCache, ProgressCache, PackBindingCache        # noqa: E402 (after sys.path)
 from dmm import fetch_all_cached_streams, is_stream_accessible    # noqa: E402
 from playback import apply_playback_metadata, build_playback_context, encode_playback_context  # noqa: E402
 from rd_auth import authorize as rd_authorize, revoke as rd_revoke  # noqa: E402
@@ -188,23 +188,33 @@ def action_play(params):
 
     ttl_hours = int(_ADDON.getSetting("stream_cache_ttl_hours") or "6")
     stream_cache = StreamCache(_USERDATA_PATH, ttl=ttl_hours * 3600)
+    pack_cache = PackBindingCache(_USERDATA_PATH)
+    bound_pack = pack_cache.get(imdb, season) if catalog_type == "series" else None
 
     # ---- 1. Try stream cache ---------------------------------------- #
     candidates = None
     if not force_refresh:
         cached = stream_cache.get(media_id)
         if cached:
-            _log(f"Cache hit for {media_id}")
-            candidates = cached
-            if _ADDON.getSetting("notify_cache_hit").lower() == "true":
-                xbmcgui.Dialog().notification(
-                    "KDMM", "Using cached stream",
-                    xbmcgui.NOTIFICATION_INFO, 2000,
-                )
+            cached_hash = ""
+            if isinstance(cached, list) and cached:
+                cached_hash = (cached[0].get("hash") or "").lower()
+            if bound_pack and cached_hash != (bound_pack.get("hash") or "").lower():
+                _log(f"Bypassing stale episode cache for {media_id}; bound pack is {bound_pack.get('hash')}")
+            else:
+                _log(f"Cache hit for {media_id}")
+                candidates = cached
+                if _ADDON.getSetting("notify_cache_hit").lower() == "true":
+                    xbmcgui.Dialog().notification(
+                        "KDMM", "Using cached stream",
+                        xbmcgui.NOTIFICATION_INFO, 2000,
+                    )
 
     # ---- 2. Fetch fresh from DMM + RD if needed -------------------- #
     if candidates is None:
         _log(f"Cache miss – querying DMM + RD for {media_id}")
+        if force_refresh and catalog_type == "series":
+            pack_cache.clear(imdb, season)
 
         fetch_result = {}
         cancel_event = threading.Event()
@@ -213,7 +223,9 @@ def action_play(params):
             try:
                 fetch_result["candidates"] = fetch_all_cached_streams(
                     catalog_type, video_id, cancel_event=cancel_event,
-                    query_title=query_title)
+                    query_title=query_title, year=year,
+                    userdata_path=_USERDATA_PATH,
+                    ignore_pack_binding=force_refresh)
             except PermissionError:
                 fetch_result["needs_auth"] = True
             except Exception as exc:
@@ -350,6 +362,12 @@ def action_clear_cache(params):
         media_id = None
 
     StreamCache(_USERDATA_PATH).clear(media_id)
+    if imdb and season:
+        PackBindingCache(_USERDATA_PATH).clear(imdb, season)
+    elif imdb:
+        PackBindingCache(_USERDATA_PATH).clear(imdb)
+    else:
+        PackBindingCache(_USERDATA_PATH).clear()
     label = media_id if media_id else "all entries"
     xbmcgui.Dialog().notification(
         "KDMM",

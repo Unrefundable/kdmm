@@ -37,6 +37,12 @@ _MIN_STREAM_BYTES = 50 * 1024 * 1024  # 50 MB
 # Sentinel returned by _try_resolve_one when RD rejects with 401 (bad token)
 _RD_AUTH_FAILURE = object()
 
+_VIDEO_EXTS = (".mkv", ".mp4", ".avi", ".m4v", ".webm", ".ts")
+_INSTALLMENT_TOKENS = {
+    "ii", "iii", "iv", "v", "vi", "vii", "viii", "ix", "x",
+    "2", "3", "4", "5", "6", "7", "8", "9", "10",
+}
+
 
 # ------------------------------------------------------------------ #
 # Title parser — extract quality metadata from torrent names
@@ -175,6 +181,57 @@ def _looks_like_release_token(token):
     return False
 
 
+def _is_release_boundary_token(token):
+    if not token:
+        return True
+    if token in _RELEASE_CONTEXT_TOKENS:
+        return True
+    if _is_year_token(token):
+        return True
+    if re.match(r"^s\d{1,2}(?:e\d{1,3})?$", token):
+        return True
+    if re.match(r"^\d{1,2}x\d{1,3}$", token):
+        return True
+    if re.match(r"^\d{3,4}p$", token):
+        return True
+    return False
+
+
+def _trailing_title_tokens(title_tokens, end):
+    trailing = []
+    for token in title_tokens[end:]:
+        if _is_release_boundary_token(token):
+            break
+        trailing.append(token)
+    return trailing
+
+
+def _has_conflicting_instalment(trailing_tokens, expected_tokens):
+    expected = set(expected_tokens or [])
+    for idx, token in enumerate(trailing_tokens):
+        if token in _INSTALLMENT_TOKENS and token not in expected:
+            return True
+        if token in ("part", "chapter", "volume", "vol") and idx + 1 < len(trailing_tokens):
+            next_token = trailing_tokens[idx + 1]
+            if next_token in _INSTALLMENT_TOKENS and next_token not in expected:
+                return True
+    return False
+
+
+def _year_rank(title, expected_year):
+    if not expected_year:
+        return 1
+    expected = str(expected_year).strip()
+    if not expected.isdigit():
+        return 1
+    years = set(re.findall(r"\b(19\d{2}|20\d{2})\b", _normalize_text(title)))
+    if expected in years:
+        return 0
+    if years:
+        return 2
+    return 1
+
+
 def _title_sequence_rank(title, expected_title):
     """
     Return a rank tuple for how well the torrent title matches the requested
@@ -199,6 +256,9 @@ def _title_sequence_rank(title, expected_title):
         end = start + len(query_tokens)
         prev_token = title_tokens[start - 1] if start > 0 else ""
         next_token = title_tokens[end] if end < len(title_tokens) else ""
+        trailing_tokens = _trailing_title_tokens(title_tokens, end)
+        if _has_conflicting_instalment(trailing_tokens, query_tokens):
+            continue
 
         if single_token_title:
             prev_ok = start == 0 or prev_token in _GENERIC_PRE_TITLE_TOKENS or _is_year_token(prev_token)
@@ -277,7 +337,217 @@ def _episode_match_rank(title, season, episode):
     return 1
 
 
-def _filter_tv_results(results, show_title, season, episode):
+def _safe_int(value, default=0):
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _setting_bool(key, default=False):
+    try:
+        value = xbmcaddon.Addon().getSetting(key)
+    except Exception:
+        value = "true" if default else "false"
+    if value == "":
+        return default
+    return value.lower() == "true"
+
+
+def _setting_int(key, default=0):
+    try:
+        value = xbmcaddon.Addon().getSetting(key)
+        return int(value) if value not in (None, "") else default
+    except Exception:
+        return default
+
+
+def _extract_episode_keys(text):
+    text = _normalize_text(text)
+    keys = set()
+    for season, episode in re.findall(r"\bs0*(\d{1,2})[ ._-]*e0*(\d{1,3})\b", text):
+        keys.add((int(season), int(episode)))
+    for season, episode in re.findall(r"\b(\d{1,2})x0*(\d{1,3})\b", text):
+        keys.add((int(season), int(episode)))
+    return keys
+
+
+def _video_file_path(file_info):
+    if isinstance(file_info, str):
+        return file_info
+    if not isinstance(file_info, dict):
+        return ""
+    return (
+        file_info.get("path")
+        or file_info.get("filename")
+        or file_info.get("name")
+        or file_info.get("file")
+        or ""
+    )
+
+
+def _video_file_size(file_info):
+    if not isinstance(file_info, dict):
+        return 0
+    return (
+        file_info.get("bytes")
+        or file_info.get("filesize")
+        or file_info.get("fileSize")
+        or file_info.get("size")
+        or 0
+    )
+
+
+def _candidate_video_files(entry):
+    files = entry.get("files") or entry.get("fileList") or entry.get("file_list") or []
+    video_files = []
+    if isinstance(files, dict):
+        files = files.values()
+    for f in files:
+        path = _video_file_path(f)
+        if path and path.lower().endswith(_VIDEO_EXTS):
+            video_files.append(f)
+    return video_files
+
+
+def _candidate_episode_keys(entry):
+    keys = set()
+    for file_info in _candidate_video_files(entry):
+        keys.update(_extract_episode_keys(_video_file_path(file_info)))
+    if not keys:
+        keys.update(_extract_episode_keys(entry.get("title") or ""))
+    return keys
+
+
+def _candidate_contains_episode(entry, season, episode):
+    if not season or not episode:
+        return True
+    wanted = (_safe_int(season), _safe_int(episode))
+    keys = _candidate_episode_keys(entry)
+    if not keys:
+        # Season-pack titles often omit individual episode names; allow them.
+        return _episode_match_rank(entry.get("title", ""), season, episode) < 2
+    return wanted in keys
+
+
+def _season_episode_coverage(entry, season):
+    season_num = _safe_int(season)
+    return sorted({
+        episode for hit_season, episode in _candidate_episode_keys(entry)
+        if hit_season == season_num
+    })
+
+
+def _title_has_season_pack_signal(title, season):
+    if not season:
+        return False
+    text = _normalize_text(title)
+    season_num = _safe_int(season)
+    if _extract_episode_keys(text):
+        return False
+    season_patterns = (
+        rf"\bs0*{season_num}\b",
+        rf"\bseason[ ._-]*0*{season_num}\b",
+        rf"\bseries[ ._-]*0*{season_num}\b",
+    )
+    return any(re.search(pattern, text) for pattern in season_patterns)
+
+
+def _consecutive_from_one(episodes):
+    expected = 1
+    for episode in sorted(set(episodes)):
+        if episode == expected:
+            expected += 1
+        elif episode > expected:
+            break
+    return expected - 1
+
+
+def _tv_pack_rank(entry, season, episode):
+    """
+    Lower is better: complete series/season packs, incomplete multi packs,
+    single-episode releases, then unknown. Uses file lists when DMM provides
+    them and title heuristics otherwise.
+    """
+    title = _normalize_text(entry.get("title") or "")
+    files = _candidate_video_files(entry)
+    coverage = _season_episode_coverage(entry, season)
+    current_ep = _safe_int(episode)
+    contains_current = not current_ep or current_ep in coverage or _candidate_contains_episode(entry, season, episode)
+    if not contains_current:
+        return (5, "missing")
+
+    has_multiple_seasons = len({s for s, _ in _candidate_episode_keys(entry)}) > 1
+    explicit_complete = any(token in title for token in (
+        "complete", "full season", "season complete", "complete season",
+        "collection", "series pack",
+    ))
+    if has_multiple_seasons and len(files) > 1:
+        return (0, "series")
+    if coverage:
+        consecutive = _consecutive_from_one(coverage)
+        if explicit_complete or consecutive >= max(current_ep, 3) and len(coverage) >= 3:
+            return (1, "season")
+        if len(coverage) > 1:
+            return (2, "multi")
+        return (3, "single")
+    if _title_has_season_pack_signal(title, season):
+        return (1, "season")
+    if explicit_complete:
+        return (1, "season")
+    if len(files) > 1:
+        return (2, "multi")
+    if len(files) == 1:
+        return (3, "single")
+    return (4, "unknown")
+
+
+def _pack_sort_rank(entry, season, episode, preference):
+    pack_rank, _scope = _tv_pack_rank(entry, season, episode)
+    if preference == 2:  # Allow singles: quality is more important.
+        return 0
+    if preference == 1:  # Balanced: prefer packs, but do not over-penalize.
+        return min(pack_rank, 2)
+    return pack_rank
+
+
+def _filter_movie_results(results, movie_title, year, strict=False):
+    filtered = list(results)
+
+    if movie_title:
+        title_matches = [
+            result for result in filtered
+            if _title_sequence_rank(result.get("title", ""), movie_title) is not None
+        ]
+        if title_matches:
+            _log(f"Movie title filter: {len(filtered)} -> {len(title_matches)} results matching {movie_title!r}")
+            filtered = title_matches
+        elif strict:
+            _log(f"Movie title filter removed all {len(filtered)} results for {movie_title!r}", xbmc.LOGWARNING)
+            return []
+        else:
+            _log(f"Movie title filter removed all {len(filtered)} results for {movie_title!r} - keeping broader set",
+                 xbmc.LOGWARNING)
+
+    if year:
+        year_matches = [
+            result for result in filtered
+            if _year_rank(result.get("title", ""), year) < 2
+        ]
+        if year_matches:
+            _log(f"Movie year filter: {len(filtered)} -> {len(year_matches)} results for {year}")
+            filtered = year_matches
+        elif strict:
+            _log(f"Movie year filter removed all {len(filtered)} results for {year}", xbmc.LOGWARNING)
+            return []
+        else:
+            _log(f"Movie year filter removed all {len(filtered)} results for {year} - keeping broader set",
+                 xbmc.LOGWARNING)
+
+    return filtered
+
+
+def _filter_tv_results(results, show_title, season, episode, strict=False):
     """
     Progressively tighten noisy DMM TV results.
 
@@ -298,6 +568,9 @@ def _filter_tv_results(results, show_title, season, episode):
         if title_matches:
             _log(f"TV title filter: {len(filtered)} -> {len(title_matches)} results matching {show_title!r}")
             filtered = title_matches
+        elif strict:
+            _log(f"TV title filter removed all {len(filtered)} results for {show_title!r}", xbmc.LOGWARNING)
+            return []
         else:
             _log(f"TV title filter removed all {len(filtered)} results for {show_title!r} - keeping broader set",
                  xbmc.LOGWARNING)
@@ -310,6 +583,9 @@ def _filter_tv_results(results, show_title, season, episode):
         if season_matches:
             _log(f"Season filter: {len(filtered)} -> {len(season_matches)} results for season {int(season)}")
             filtered = season_matches
+        elif strict:
+            _log(f"Season filter removed all {len(filtered)} results for season {int(season)}", xbmc.LOGWARNING)
+            return []
         else:
             _log(f"Season filter removed all {len(filtered)} results for season {int(season)} - keeping broader set",
                  xbmc.LOGWARNING)
@@ -318,10 +594,14 @@ def _filter_tv_results(results, show_title, season, episode):
         episode_matches = [
             result for result in filtered
             if _episode_match_rank(result.get("title", ""), season, episode) < 2
+            and _candidate_contains_episode(result, season, episode)
         ]
         if episode_matches:
             _log(f"Episode filter: {len(filtered)} -> {len(episode_matches)} results for E{int(episode):02d}")
             filtered = episode_matches
+        elif strict:
+            _log(f"Episode filter removed all {len(filtered)} results for E{int(episode):02d}", xbmc.LOGWARNING)
+            return []
         else:
             _log(f"Episode filter removed all {len(filtered)} results for E{int(episode):02d} - keeping broader set",
                  xbmc.LOGWARNING)
@@ -329,13 +609,23 @@ def _filter_tv_results(results, show_title, season, episode):
     return filtered
 
 
-def _build_tv_sort_key(quality_sort_key, show_title, season, episode):
+def _build_movie_sort_key(quality_sort_key, movie_title, year):
+    def _sort_key(entry):
+        title = entry.get("title") or ""
+        title_rank = _title_sequence_rank(title, movie_title) or (9, 99)
+        return title_rank + (_year_rank(title, year),) + quality_sort_key(entry)
+
+    return _sort_key
+
+
+def _build_tv_sort_key(quality_sort_key, show_title, season, episode, pack_preference):
     def _sort_key(entry):
         title = entry.get("title") or ""
         title_rank = _title_sequence_rank(title, show_title) or (9, 99)
         season_rank = _season_match_rank(title, season)
         episode_rank = _episode_match_rank(title, season, episode)
-        return title_rank + (episode_rank, season_rank) + quality_sort_key(entry)
+        pack_rank = _pack_sort_rank(entry, season, episode, pack_preference)
+        return title_rank + (pack_rank, episode_rank, season_rank) + quality_sort_key(entry)
 
     return _sort_key
 
@@ -358,6 +648,12 @@ def _get_quality_preferences():
     src_pref = int(addon.getSetting("source_priority") or "0")
 
     return preferred_groups, hdr_pref, res_pref, src_pref
+
+
+def _get_matching_preferences():
+    strict_matching = _setting_bool("strict_title_matching", False)
+    tv_pack_preference = _setting_int("tv_pack_preference", 0)
+    return strict_matching, tv_pack_preference
 
 
 def _build_sort_key(preferred_groups, hdr_pref, res_pref, src_pref):
@@ -696,13 +992,25 @@ def _cancelled(cancel_event):
     return cancel_event and cancel_event.is_set()
 
 
-def _try_resolve_one(candidate, api_token, season, episode, cancel_event):
+def _episode_file_sort_key(file_info, query_title, season, episode, year=None):
+    path = _video_file_path(file_info)
+    title_rank = _title_sequence_rank(path, query_title) if query_title else (1, 99)
+    if title_rank is None:
+        title_rank = (9, 99)
+    episode_rank = _episode_match_rank(path, season, episode)
+    season_rank = _season_match_rank(path, season)
+    year_score = _year_rank(path, year)
+    size = _video_file_size(file_info)
+    return title_rank + (episode_rank, season_rank, year_score, -size)
+
+
+def _try_resolve_one(candidate, api_token, season, episode, cancel_event,
+                     query_title=None, year=None):
     """
     Try to resolve a single candidate hash via RD direct-add.
     Returns a {"url", "headers", "name"} dict on success, None on failure.
     Runs in a worker thread — must be thread-safe.
     """
-    video_exts = (".mkv", ".mp4", ".avi", ".m4v", ".webm", ".ts")
     ep_markers = []
     if season and episode:
         ep_markers = [
@@ -751,33 +1059,47 @@ def _try_resolve_one(candidate, api_token, season, episode, cancel_event):
             if ep_markers:
                 files = info.get("files") or []
                 selected = [f for f in files if f.get("selected") == 1]
+                matches = []
                 for idx, f in enumerate(selected):
                     fname = f.get("path", "").lower()
                     if any(m in fname for m in ep_markers):
-                        ep_link_idx = idx
-                        _log(f"{h8} season pack: using link[{idx}] for {ep_markers[0]}")
-                        break
+                        matches.append((idx, f))
+                if matches:
+                    ep_link_idx, best_file = min(
+                        matches,
+                        key=lambda item: _episode_file_sort_key(
+                            item[1], query_title, season, episode, year
+                        ),
+                    )
+                    _log(f"{h8} season pack: using link[{ep_link_idx}] "
+                         f"for {ep_markers[0]} ({best_file.get('path', '')})")
         elif status == "waiting_files_selection":
             files = info.get("files") or []
             best_file_id = None
-            best_size = 0
             # First pass: match episode if applicable
+            episode_files = []
             for f in files:
                 fname = f.get("path", "").lower()
-                fsize = f.get("bytes", 0)
-                if not any(fname.endswith(e) for e in video_exts):
+                if not any(fname.endswith(e) for e in _VIDEO_EXTS):
                     continue
                 if ep_markers and not any(m in fname for m in ep_markers):
                     continue
-                if fsize > best_size:
-                    best_size = fsize
-                    best_file_id = f.get("id")
+                episode_files.append(f)
+            if episode_files:
+                best_file = min(
+                    episode_files,
+                    key=lambda f: _episode_file_sort_key(
+                        f, query_title, season, episode, year
+                    ),
+                )
+                best_file_id = best_file.get("id")
             # Second pass: any video file
             if not best_file_id:
+                best_size = 0
                 for f in files:
                     fname = f.get("path", "").lower()
                     fsize = f.get("bytes", 0)
-                    if any(fname.endswith(e) for e in video_exts) and fsize > best_size:
+                    if any(fname.endswith(e) for e in _VIDEO_EXTS) and fsize > best_size:
                         best_size = fsize
                         best_file_id = f.get("id")
             if not best_file_id:
@@ -821,7 +1143,15 @@ def _try_resolve_one(candidate, api_token, season, episode, cancel_event):
 
         if url:
             _log(f"{h8} resolved: {filename!r}")
-            return {"url": url, "headers": {}, "name": filename}
+            return {
+                "url": url,
+                "headers": {},
+                "name": filename,
+                "hash": candidate.get("hash"),
+                "title": candidate.get("title", ""),
+                "pack_scope": candidate.get("pack_scope", ""),
+                "pack_rank": candidate.get("pack_rank"),
+            }
         return None
 
     except Exception as exc:
@@ -837,7 +1167,8 @@ def _try_resolve_one(candidate, api_token, season, episode, cancel_event):
 
 
 def _resolve_by_direct_add(candidates_info, api_token, season=None, episode=None,
-                           max_resolve=1, cancel_event=None):
+                           max_resolve=1, cancel_event=None, query_title=None,
+                           year=None):
     """
     Resolve streams by adding magnets to RD and checking for instant cache.
     Runs candidates in PARALLEL in batches of 3 (to avoid RD 429 rate-limits),
@@ -871,7 +1202,8 @@ def _resolve_by_direct_add(candidates_info, api_token, season=None, episode=None
         pool = ThreadPoolExecutor(max_workers=batch_size)
         futures = {
             pool.submit(
-                _try_resolve_one, c, api_token, season, episode, combined
+                _try_resolve_one, c, api_token, season, episode, combined,
+                query_title, year
             ): c
             for c in batch
         }
@@ -1018,7 +1350,9 @@ def is_stream_accessible(url, headers):
         return True
 
 
-def fetch_all_cached_streams(catalog_type, video_id, cancel_event=None, query_title=None):
+def fetch_all_cached_streams(catalog_type, video_id, cancel_event=None,
+                             query_title=None, year=None, userdata_path=None,
+                             ignore_pack_binding=False):
     """
     Main entry point.  Queries DMM's hash database, then resolves cached
     streams via RD direct-add.  Returns a sorted list of
@@ -1041,6 +1375,37 @@ def fetch_all_cached_streams(catalog_type, video_id, cancel_event=None, query_ti
     imdb_id = parts[0]
     season = parts[1] if len(parts) > 1 else None
     episode = parts[2] if len(parts) > 2 else None
+    strict_matching, tv_pack_preference = _get_matching_preferences()
+    pack_cache = None
+    if catalog_type != "movie" and userdata_path:
+        try:
+            from cache import PackBindingCache
+            pack_cache = PackBindingCache(userdata_path)
+        except Exception as exc:
+            _log(f"Pack binding cache unavailable: {exc}", xbmc.LOGWARNING)
+
+    if pack_cache and not ignore_pack_binding:
+        binding = pack_cache.get(imdb_id, season)
+        if binding:
+            bound_candidate = {
+                "hash": (binding.get("hash") or "").lower(),
+                "title": binding.get("title") or "Bound pack",
+                "pack_scope": binding.get("scope") or "season",
+                "pack_rank": 1,
+            }
+            if len(bound_candidate["hash"]) == 40:
+                _log(f"Trying bound pack for {imdb_id} S{int(season):02d}: "
+                     f"{bound_candidate['hash'][:8]} {bound_candidate['title']!r}")
+                resolved = _resolve_by_direct_add(
+                    [bound_candidate], api_token, season=season, episode=episode,
+                    max_resolve=1, cancel_event=cancel_event,
+                    query_title=query_title, year=year,
+                )
+                if resolved:
+                    return resolved
+                _log(f"Bound pack failed for {imdb_id} S{int(season):02d}; clearing binding",
+                     xbmc.LOGWARNING)
+                pack_cache.clear(imdb_id, season)
 
     # 1. Get all hashes from DMM
     try:
@@ -1065,7 +1430,20 @@ def fetch_all_cached_streams(catalog_type, video_id, cancel_event=None, query_ti
         return []
 
     if catalog_type != "movie":
-        dmm_results = _filter_tv_results(dmm_results, query_title, season, episode)
+        dmm_results = _filter_tv_results(
+            dmm_results, query_title, season, episode, strict=strict_matching
+        )
+    else:
+        dmm_results = _filter_movie_results(
+            dmm_results, query_title, year, strict=strict_matching
+        )
+
+    if not dmm_results:
+        xbmcgui.Dialog().notification(
+            "KDMM",
+            "No torrents matched this title/year",
+            xbmcgui.NOTIFICATION_WARNING, 6000)
+        return []
 
     # Build hash → result map
     hash_map = {}
@@ -1086,9 +1464,12 @@ def fetch_all_cached_streams(catalog_type, video_id, cancel_event=None, query_ti
     sort_key = _build_sort_key(preferred_groups, hdr_pref, res_pref, src_pref)
 
     if catalog_type != "movie":
-        sorted_dmm = sorted(dmm_results, key=_build_tv_sort_key(sort_key, query_title, season, episode))
+        sorted_dmm = sorted(
+            dmm_results,
+            key=_build_tv_sort_key(sort_key, query_title, season, episode, tv_pack_preference)
+        )
     else:
-        sorted_dmm = sorted(dmm_results, key=sort_key)
+        sorted_dmm = sorted(dmm_results, key=_build_movie_sort_key(sort_key, query_title, year))
 
     # Log the top picks so user can verify ranking
     for i, r in enumerate(sorted_dmm[:5]):
@@ -1098,20 +1479,33 @@ def fetch_all_cached_streams(catalog_type, video_id, cancel_event=None, query_ti
             title_rank = _title_sequence_rank(r.get("title", ""), query_title) or (9, 99)
             episode_rank = _episode_match_rank(r.get("title", ""), season, episode)
             season_rank = _season_match_rank(r.get("title", ""), season)
-            extra = f" match={title_rank} ep={episode_rank} season={season_rank}"
+            pack_rank, pack_scope = _tv_pack_rank(r, season, episode)
+            extra = f" match={title_rank} pack={pack_rank}:{pack_scope} ep={episode_rank} season={season_rank}"
+        else:
+            extra = f" match={_title_sequence_rank(r.get('title', ''), query_title) or (9, 99)} year={_year_rank(r.get('title', ''), year)}"
         _log(f"  #{i+1}: {r.get('title','?')[:80]} "
              f"[hdr={parsed['hdr']} res={parsed['res']} src={parsed['src']} grp={parsed['group']}{extra}]")
 
-    candidates = [
-        {"hash": (r.get("hash") or "").lower(), "title": r.get("title", "Unknown")}
-        for r in sorted_dmm if len((r.get("hash") or "")) == 40
-    ][:20]  # top 20 by quality
+    candidates = []
+    for r in sorted_dmm:
+        h = (r.get("hash") or "").lower()
+        if len(h) != 40:
+            continue
+        candidate = {"hash": h, "title": r.get("title", "Unknown")}
+        if catalog_type != "movie":
+            pack_rank, pack_scope = _tv_pack_rank(r, season, episode)
+            candidate["pack_rank"] = pack_rank
+            candidate["pack_scope"] = pack_scope
+        candidates.append(candidate)
+        if len(candidates) >= 20:
+            break
 
     _log(f"DMM returned {len(hash_map)} hashes, checking top {len(candidates)} in parallel on RD")
 
     resolved = _resolve_by_direct_add(
         candidates, api_token, season=season, episode=episode,
         max_resolve=1, cancel_event=cancel_event,
+        query_title=query_title, year=year,
     )
 
     if not resolved:
@@ -1120,5 +1514,13 @@ def fetch_all_cached_streams(catalog_type, video_id, cancel_event=None, query_ti
             xbmcgui.NOTIFICATION_WARNING, 6000)
     else:
         _log(f"Resolved {len(resolved)} stream(s), top: {resolved[0]['name']!r}")
+        top = resolved[0]
+        if pack_cache and top.get("pack_rank") in (0, 1):
+            pack_cache.set(
+                imdb_id, season, top.get("hash"), title=top.get("title", ""),
+                scope=top.get("pack_scope", "season"),
+            )
+            _log(f"Bound {imdb_id} S{int(season):02d} to "
+                 f"{(top.get('hash') or '')[:8]} ({top.get('pack_scope', 'season')})")
 
     return resolved
