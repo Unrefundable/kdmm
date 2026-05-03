@@ -1,0 +1,43 @@
+<?xml version='1.0' encoding='utf-8'?>
+<addons>
+    <addon id="plugin.video.kdmm" version="2.6.7" name="KDMM" provider-name="Unrefundable">
+    <requires>
+        <import addon="xbmc.python" version="3.0.0" />
+        <import addon="script.module.requests" version="2.9.1" />
+        <import addon="script.module.qrcode" version="5.1" optional="true" />
+    </requires>
+    <extension point="xbmc.python.pluginsource" library="default.py">
+        <provides>video</provides>
+    </extension>
+    <extension point="xbmc.service" library="service.py" start="login" />
+    <extension point="xbmc.addon.metadata">
+        <summary lang="en_GB">Kodi Debrid Media Manager - Auto-play with resume</summary>
+        <description lang="en_GB">
+            Queries Debrid Media Manager's torrent database, checks Real-Debrid
+            for cached availability, resolves a direct-play URL, and plays it in
+            the Bingie skin via TMDb Bingie Helper. Supports auto-play, resume
+            from last position, preferred release group sorting, and IntroDB.app
+            plus TheIntroDB-backed skip intro/recap/credits/preview with next-
+            episode overlays.
+        </description>
+        <platform>all</platform>
+    </extension>
+</addon>
+    <addon id="repository.unrefundable.kdmm" version="1.0.0" name="Unrefundable KDMM Repo" provider-name="Unrefundable">
+    <requires>
+        <import addon="xbmc.addon" version="12.0.0" />
+    </requires>
+    <extension point="xbmc.addon.repository" name="Unrefundable KDMM">
+        <dir>
+            <info compressed="false">https://unrefundable.github.io/kdmm/addons.xml</info>
+            <checksum>https://unrefundable.github.io/kdmm/addons.xml.md5</checksum>
+            <datadir zip="true">https://unrefundable.github.io/kdmm/</datadir>
+        </dir>
+    </extension>
+    <extension point="xbmc.addon.metadata">
+        <summary lang="en_GB">Unrefundable KDMM Repository</summary>
+        <description lang="en_GB">Repository for the KDMM (Kodi Debrid Media Manager) addon. Queries DMM's torrent database and resolves cached streams via Real-Debrid for auto-play with the Bingie skin.</description>
+        <platform>all</platform>
+    </extension>
+</addon>
+</addons>
