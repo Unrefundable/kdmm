@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+from urllib.parse import urlencode
 
 import xbmc
 import xbmcaddon
@@ -24,8 +25,14 @@ def _import_bingie_helper_get_next_episodes():
         return None
 
     modules_path = os.path.join(addon_path, "resources", "modules")
-    if modules_path not in sys.path:
-        sys.path.insert(0, modules_path)
+    candidate_paths = (
+        modules_path,
+        os.path.join(addon_path, "resources", "lib"),
+        addon_path,
+    )
+    for path in reversed(candidate_paths):
+        if path and path not in sys.path:
+            sys.path.insert(0, path)
 
     try:
         import tmdbbingiehelper_lib  # noqa: F401
@@ -34,6 +41,30 @@ def _import_bingie_helper_get_next_episodes():
     except Exception as exc:
         _log(f"Could not import Bingie helper next-episode API: {exc}", xbmc.LOGWARNING)
         return None
+
+
+def _fallback_next_episode(context, season, episode):
+    imdb_id = str(context.get("imdb_id") or "").strip()
+    tmdb_id = str(context.get("tmdb_id") or "").strip()
+    if not imdb_id or not tmdb_id:
+        return None
+
+    params = {
+        "action": "play_episode",
+        "imdb": imdb_id,
+        "tmdb": tmdb_id,
+        "season": season,
+        "episode": episode + 1,
+        "showtitle": context.get("showtitle") or "",
+    }
+
+    _log(f"Using fallback next episode URL for S{season}E{episode + 1}")
+    return {
+        "play_url": f"plugin://plugin.video.kdmm/?{urlencode(params)}",
+        "season": season,
+        "episode": episode + 1,
+        "title": "",
+    }
 
 
 def get_next_episode(context):
@@ -49,13 +80,13 @@ def get_next_episode(context):
 
     get_next_episodes = _import_bingie_helper_get_next_episodes()
     if not get_next_episodes:
-        return None
+        return _fallback_next_episode(context, season, episode)
 
     try:
         items = get_next_episodes(tmdb_id, season, episode, context.get("player_file") or "kdmm.json") or []
     except Exception as exc:
         _log(f"Next-episode lookup failed: {exc}", xbmc.LOGWARNING)
-        return None
+        return _fallback_next_episode(context, season, episode)
 
     current_key = (season, episode)
     best_item = None
@@ -70,14 +101,14 @@ def get_next_episode(context):
             best_key = candidate_key
 
     if not best_item or not best_key:
-        return None
+        return _fallback_next_episode(context, season, episode)
 
     try:
         play_url = best_item.get_url()
     except Exception:
         play_url = None
     if not play_url:
-        return None
+        return _fallback_next_episode(context, season, episode)
 
     infolabels = getattr(best_item, "infolabels", {}) or {}
     return {

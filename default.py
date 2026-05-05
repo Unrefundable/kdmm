@@ -48,7 +48,7 @@ NO_RESUME = len(sys.argv) > 3 and "resume:false" in sys.argv[3].lower()
 sys.path.insert(0, os.path.join(_ADDON_PATH, "lib"))
 
 from cache import StreamCache, ProgressCache, PackBindingCache        # noqa: E402 (after sys.path)
-from dmm import fetch_all_cached_streams, is_stream_accessible    # noqa: E402
+from dmm import fetch_all_cached_streams, is_av1_stream, is_stream_accessible    # noqa: E402
 from playback import apply_playback_metadata, build_playback_context, encode_playback_context  # noqa: E402
 from rd_auth import authorize as rd_authorize, revoke as rd_revoke  # noqa: E402
 
@@ -149,6 +149,16 @@ def _play_stream(media_id, url, headers_dict, imdb, tmdb, title, showtitle,
     xbmcplugin.setResolvedUrl(ADDON_HANDLE, True, li)
 
 
+def _filter_playable_candidates(candidates):
+    if isinstance(candidates, dict):
+        candidates = [candidates]
+    filtered = [candidate for candidate in (candidates or []) if not is_av1_stream(candidate)]
+    removed = len(candidates or []) - len(filtered)
+    if removed:
+        _log(f"Filtered {removed} cached/resolved AV1 candidate(s)", xbmc.LOGWARNING)
+    return filtered
+
+
 # ------------------------------------------------------------------ #
 # Actions
 # ------------------------------------------------------------------ #
@@ -203,8 +213,16 @@ def action_play(params):
                 _log(f"Bypassing stale episode cache for {media_id}; bound pack is {bound_pack.get('hash')}")
             else:
                 _log(f"Cache hit for {media_id}")
-                candidates = cached
-                if _ADDON.getSetting("notify_cache_hit").lower() == "true":
+                candidates = _filter_playable_candidates(cached)
+                if not candidates:
+                    _log(f"Cached candidates for {media_id} were AV1 only; refreshing")
+                    stream_cache.clear(media_id)
+                    if catalog_type == "series":
+                        pack_cache.clear(imdb, season)
+                    candidates = None
+                    bound_pack = None
+                    cached = None
+                if cached and candidates and _ADDON.getSetting("notify_cache_hit").lower() == "true":
                     xbmcgui.Dialog().notification(
                         "KDMM", "Using cached stream",
                         xbmcgui.NOTIFICATION_INFO, 2000,
@@ -298,12 +316,12 @@ def action_play(params):
             xbmcplugin.setResolvedUrl(ADDON_HANDLE, False, xbmcgui.ListItem())
             return
 
-        candidates = fetch_result.get("candidates") or []
+        candidates = _filter_playable_candidates(fetch_result.get("candidates") or [])
 
         if not candidates:
             xbmcgui.Dialog().notification(
                 "KDMM",
-                "No cached streams found – check RD authorization",
+                "No non-AV1 cached streams found",
                 xbmcgui.NOTIFICATION_ERROR, 8000)
             xbmcplugin.setResolvedUrl(ADDON_HANDLE, False, xbmcgui.ListItem())
             return
@@ -312,8 +330,7 @@ def action_play(params):
         _log(f"Stored {len(candidates)} candidate(s) for {media_id}: {candidates[0]['name']!r}")
 
     # ---- 3. Ensure candidates is a list ----------------------------- #
-    if isinstance(candidates, dict):
-        candidates = [candidates]
+    candidates = _filter_playable_candidates(candidates)
 
     # ---- 4. Store full candidate list for service.py retry ----------- #
     chosen_idx = 0

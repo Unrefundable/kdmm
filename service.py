@@ -21,6 +21,7 @@ _USERDATA_PATH = xbmcvfs.translatePath(
 sys.path.insert(0, os.path.join(_ADDON_PATH, "lib"))
 
 from cache import StreamCache, ProgressCache, PackBindingCache   # noqa: E402
+from dmm import is_av1_stream  # noqa: E402
 from introdb_client import query_all_segments  # noqa: E402
 from next_episode import get_next_episode, play_next_episode  # noqa: E402
 from playback import apply_playback_metadata, decode_playback_context  # noqa: E402
@@ -263,7 +264,9 @@ class SegmentController:
         return self._next_episode
 
     def _should_use_next_overlay(self, all_segments, idx, segment_type, api_end, total_time):
-        if segment_type not in ("credits", "preview"):
+        if segment_type == "credits":
+            return True
+        if segment_type != "preview":
             return False
         later_segments = [
             seg for seg in all_segments[idx + 1:]
@@ -474,6 +477,9 @@ class BridgePlayer(xbmc.Player):
 
         next_stream = None
         for c in candidates:
+            if is_av1_stream(c):
+                _log(f"Candidate {c.get('name', '?')!r} is AV1 – skipping", xbmc.LOGWARNING)
+                continue
             url = c.get("url", "").split("|")[0]
             if url in self._tried_urls:
                 continue
