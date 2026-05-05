@@ -38,6 +38,7 @@ _MIN_STREAM_BYTES = 50 * 1024 * 1024  # 50 MB
 _RD_AUTH_FAILURE = object()
 
 _VIDEO_EXTS = (".mkv", ".mp4", ".avi", ".m4v", ".webm", ".ts")
+_AV1_TOKEN_RE = re.compile(r"(^|[^a-z0-9])(?:av1|av01)([^a-z0-9]|$)", re.I)
 _INSTALLMENT_TOKENS = {
     "ii", "iii", "iv", "v", "vi", "vii", "viii", "ix", "x",
     "2", "3", "4", "5", "6", "7", "8", "9", "10",
@@ -137,6 +138,24 @@ def _parse_title(title):
         "src": src,
         "group": group,
     }
+
+
+def is_av1_stream(value):
+    """
+    Return True when a title, filename, URL, or candidate dict advertises AV1.
+
+    This intentionally matches release tokens like "AV1" and "AV01" without
+    treating unrelated words containing those letters as codec metadata.
+    """
+    if isinstance(value, dict):
+        parts = [
+            value.get("name"),
+            value.get("title"),
+            value.get("filename"),
+            value.get("url"),
+        ]
+        return any(is_av1_stream(part) for part in parts if part)
+    return bool(_AV1_TOKEN_RE.search(str(value or "")))
 
 
 def _normalize_text(text):
@@ -609,6 +628,14 @@ def _filter_tv_results(results, show_title, season, episode, strict=False):
     return filtered
 
 
+def _filter_av1_results(results):
+    filtered = [result for result in results if not is_av1_stream(result.get("title", ""))]
+    removed = len(results) - len(filtered)
+    if removed:
+        _log(f"AV1 filter: removed {removed} unsupported result(s)")
+    return filtered
+
+
 def _build_movie_sort_key(quality_sort_key, movie_title, year):
     def _sort_key(entry):
         title = entry.get("title") or ""
@@ -1049,6 +1076,11 @@ def _try_resolve_one(candidate, api_token, season, episode, cancel_event,
         status = info.get("status", "")
         _log(f"{h8} status: {status!r}")
 
+        if is_av1_stream(candidate.get("title")):
+            _log(f"{h8} skipped AV1 candidate: {candidate.get('title')!r}", xbmc.LOGWARNING)
+            _rd_delete(f"/torrents/delete/{rd_id}", api_token)
+            return None
+
         if _cancelled(cancel_event):
             _rd_delete(f"/torrents/delete/{rd_id}", api_token)
             return None
@@ -1062,8 +1094,14 @@ def _try_resolve_one(candidate, api_token, season, episode, cancel_event,
                 matches = []
                 for idx, f in enumerate(selected):
                     fname = f.get("path", "").lower()
+                    if is_av1_stream(fname):
+                        continue
                     if any(m in fname for m in ep_markers):
                         matches.append((idx, f))
+                if not matches:
+                    _log(f"{h8} no non-AV1 episode file in selected season pack")
+                    _rd_delete(f"/torrents/delete/{rd_id}", api_token)
+                    return None
                 if matches:
                     ep_link_idx, best_file = min(
                         matches,
@@ -1082,6 +1120,8 @@ def _try_resolve_one(candidate, api_token, season, episode, cancel_event,
                 fname = f.get("path", "").lower()
                 if not any(fname.endswith(e) for e in _VIDEO_EXTS):
                     continue
+                if is_av1_stream(fname):
+                    continue
                 if ep_markers and not any(m in fname for m in ep_markers):
                     continue
                 episode_files.append(f)
@@ -1099,11 +1139,13 @@ def _try_resolve_one(candidate, api_token, season, episode, cancel_event,
                 for f in files:
                     fname = f.get("path", "").lower()
                     fsize = f.get("bytes", 0)
-                    if any(fname.endswith(e) for e in _VIDEO_EXTS) and fsize > best_size:
+                    if (any(fname.endswith(e) for e in _VIDEO_EXTS)
+                            and not is_av1_stream(fname)
+                            and fsize > best_size):
                         best_size = fsize
                         best_file_id = f.get("id")
             if not best_file_id:
-                _log(f"{h8} no video file in {len(files)} files")
+                _log(f"{h8} no non-AV1 video file in {len(files)} files")
                 _rd_delete(f"/torrents/delete/{rd_id}", api_token)
                 return None
 
@@ -1140,6 +1182,10 @@ def _try_resolve_one(candidate, api_token, season, episode, cancel_event,
         url = unrestrict.get("download")
         filename = unrestrict.get("filename", candidate.get("title", "Stream"))
         _rd_delete(f"/torrents/delete/{rd_id}", api_token)
+
+        if is_av1_stream(filename) or is_av1_stream(url):
+            _log(f"{h8} resolved AV1 stream skipped: {filename!r}", xbmc.LOGWARNING)
+            return None
 
         if url:
             _log(f"{h8} resolved: {filename!r}")
@@ -1387,6 +1433,12 @@ def fetch_all_cached_streams(catalog_type, video_id, cancel_event=None,
     if pack_cache and not ignore_pack_binding:
         binding = pack_cache.get(imdb_id, season)
         if binding:
+            if is_av1_stream(binding.get("title")):
+                _log(f"Clearing AV1 bound pack for {imdb_id} S{int(season):02d}: "
+                     f"{binding.get('title')!r}", xbmc.LOGWARNING)
+                pack_cache.clear(imdb_id, season)
+                binding = None
+        if binding:
             bound_candidate = {
                 "hash": (binding.get("hash") or "").lower(),
                 "title": binding.get("title") or "Bound pack",
@@ -1438,10 +1490,12 @@ def fetch_all_cached_streams(catalog_type, video_id, cancel_event=None,
             dmm_results, query_title, year, strict=strict_matching
         )
 
+    dmm_results = _filter_av1_results(dmm_results)
+
     if not dmm_results:
         xbmcgui.Dialog().notification(
             "KDMM",
-            "No torrents matched this title/year",
+            "No non-AV1 torrents matched this title/year",
             xbmcgui.NOTIFICATION_WARNING, 6000)
         return []
 
