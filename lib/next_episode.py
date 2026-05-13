@@ -1,10 +1,14 @@
 import json
 import os
+import re
 import sys
 from urllib.parse import urlencode
 
 import xbmc
 import xbmcaddon
+
+TMDB_API_URL = "https://api.themoviedb.org/3"
+TMDB_API_KEY_FALLBACK = "4f13072a99739d0780f37a524c15941d"
 
 
 def _log(message, level=xbmc.LOGINFO):
@@ -18,24 +22,34 @@ def _extract_int(value):
         return None
 
 
-def _import_bingie_helper_get_next_episodes():
+def _addon_path(addon_id):
     try:
-        addon_path = xbmcaddon.Addon("plugin.video.tmdb.bingie.helper").getAddonInfo("path")
+        return xbmcaddon.Addon(addon_id).getAddonInfo("path")
     except Exception:
         return None
 
-    modules_path = os.path.join(addon_path, "resources", "modules")
+
+def _add_bingie_helper_paths():
+    addon_path = _addon_path("plugin.video.tmdb.bingie.helper")
+    if not addon_path:
+        return None
+
     candidate_paths = (
-        modules_path,
+        os.path.join(addon_path, "resources", "modules"),
+        os.path.join(addon_path, "resources"),
         os.path.join(addon_path, "resources", "lib"),
         addon_path,
     )
     for path in reversed(candidate_paths):
         if path and path not in sys.path:
             sys.path.insert(0, path)
+    return addon_path
 
+
+def _import_bingie_helper_get_next_episodes():
+    if not _add_bingie_helper_paths():
+        return None
     try:
-        import tmdbbingiehelper_lib  # noqa: F401
         from tmdbbingiehelper.lib.player.details import get_next_episodes
         return get_next_episodes
     except Exception as exc:
@@ -44,28 +58,121 @@ def _import_bingie_helper_get_next_episodes():
 
 
 def _import_bingie_helper_tmdb_api():
-    try:
-        addon_path = xbmcaddon.Addon("plugin.video.tmdb.bingie.helper").getAddonInfo("path")
-    except Exception:
+    if not _add_bingie_helper_paths():
         return None
-
-    modules_path = os.path.join(addon_path, "resources", "modules")
-    candidate_paths = (
-        modules_path,
-        os.path.join(addon_path, "resources", "lib"),
-        addon_path,
-    )
-    for path in reversed(candidate_paths):
-        if path and path not in sys.path:
-            sys.path.insert(0, path)
-
     try:
-        import tmdbbingiehelper_lib  # noqa: F401
         from tmdbbingiehelper.lib.api.tmdb.api import TMDb
         return TMDb
     except Exception as exc:
         _log(f"Could not import Bingie helper TMDb API: {exc}", xbmc.LOGWARNING)
         return None
+
+
+def _add_module_lib_path(addon_id):
+    try:
+        addon_path = xbmcaddon.Addon(addon_id).getAddonInfo("path")
+    except Exception:
+        return
+    lib_path = os.path.join(addon_path, "lib")
+    if lib_path not in sys.path:
+        sys.path.insert(0, lib_path)
+
+
+def _get_requests():
+    for mod in ("script.module.requests", "script.module.urllib3",
+                "script.module.chardet", "script.module.idna",
+                "script.module.certifi"):
+        _add_module_lib_path(mod)
+    import requests
+    return requests
+
+
+def _read_bingie_tmdb_api_key():
+    addon_path = _addon_path("plugin.video.tmdb.bingie.helper")
+    if not addon_path:
+        return ""
+    key_file = os.path.join(
+        addon_path, "resources", "tmdbbingiehelper", "lib",
+        "api", "api_keys", "tmdb.py",
+    )
+    try:
+        with open(key_file, "r", encoding="utf-8") as fh:
+            content = fh.read()
+    except Exception as exc:
+        _log(f"Could not read Bingie Helper TMDb API key: {exc}", xbmc.LOGWARNING)
+        return ""
+    match = re.search(r"API_KEY\s*=\s*['\"]([^'\"]+)['\"]", content)
+    return match.group(1) if match else ""
+
+
+def _tmdb_api_key():
+    return _read_bingie_tmdb_api_key() or TMDB_API_KEY_FALLBACK
+
+
+def _tmdb_get_json(path, api_key):
+    requests = _get_requests()
+    response = requests.get(
+        f"{TMDB_API_URL}/{path.lstrip('/')}",
+        params={"api_key": api_key},
+        timeout=10,
+    )
+    response.raise_for_status()
+    return response.json() or {}
+
+
+def _episode_from_tmdb(context, season_number, episode_item):
+    episode_number = _extract_int(episode_item.get("episode_number"))
+    if not episode_number:
+        return None
+    return _build_kdmm_episode_url(
+        context,
+        season_number,
+        episode_number,
+        title=episode_item.get("name") or "",
+    )
+
+
+def _direct_tmdb_next_episode(context, season, episode):
+    tmdb_id = _extract_int(context.get("tmdb_id"))
+    if not tmdb_id:
+        return None
+
+    api_key = _tmdb_api_key()
+    if not api_key:
+        return None
+
+    try:
+        show = _tmdb_get_json(f"tv/{tmdb_id}", api_key)
+        seasons = sorted(
+            (
+                s for s in show.get("seasons", [])
+                if _extract_int(s.get("season_number")) and _extract_int(s.get("season_number")) > 0
+            ),
+            key=lambda s: _extract_int(s.get("season_number")) or 0,
+        )
+        for season_item in seasons:
+            season_number = _extract_int(season_item.get("season_number"))
+            if not season_number or season_number < season:
+                continue
+            season_data = _tmdb_get_json(f"tv/{tmdb_id}/season/{season_number}", api_key)
+            episodes = sorted(
+                season_data.get("episodes", []),
+                key=lambda e: _extract_int(e.get("episode_number")) or 0,
+            )
+            for episode_item in episodes:
+                episode_number = _extract_int(episode_item.get("episode_number"))
+                if not episode_number:
+                    continue
+                if season_number == season and episode_number <= episode:
+                    continue
+                next_episode = _episode_from_tmdb(context, season_number, episode_item)
+                if next_episode:
+                    _log(f"Using direct TMDb next episode URL for S{season_number}E{episode_number}")
+                    return next_episode
+    except Exception as exc:
+        _log(f"Direct TMDb next-episode fallback failed: {exc}", xbmc.LOGWARNING)
+
+    return None
 
 
 def _item_episode_key(item):
@@ -126,8 +233,10 @@ def _build_kdmm_episode_url(context, season, episode, title=""):
 def _fallback_next_episode(context, season, episode):
     TMDb = _import_bingie_helper_tmdb_api()
     if not TMDb:
-        _log("No catalog API available for next-episode fallback", xbmc.LOGWARNING)
-        return None
+        next_episode = _direct_tmdb_next_episode(context, season, episode)
+        if not next_episode:
+            _log("No catalog API available for next-episode fallback", xbmc.LOGWARNING)
+        return next_episode
 
     tmdb_id = _extract_int(context.get("tmdb_id"))
     if not tmdb_id:
@@ -137,7 +246,7 @@ def _fallback_next_episode(context, season, episode):
         items = TMDb().get_flatseasons_list(tmdb_id) or []
     except Exception as exc:
         _log(f"Catalog next-episode fallback failed: {exc}", xbmc.LOGWARNING)
-        return None
+        return _direct_tmdb_next_episode(context, season, episode)
 
     current_key = (season, episode)
     best_item = None
@@ -151,8 +260,10 @@ def _fallback_next_episode(context, season, episode):
             best_key = candidate_key
 
     if not best_key:
-        _log(f"No real next episode found after S{season}E{episode}")
-        return None
+        next_episode = _direct_tmdb_next_episode(context, season, episode)
+        if not next_episode:
+            _log(f"No real next episode found after S{season}E{episode}")
+        return next_episode
 
     next_episode = _build_kdmm_episode_url(
         context,
