@@ -15,6 +15,7 @@
         <setting id="hdr_priority" type="enum" label="HDR preference" values="Dolby Vision|HDR10+|HDR10|Any HDR|SDR only" default="0"/>
         <setting id="resolution_priority" type="enum" label="Resolution preference" values="4K (2160p)|1080p|720p" default="0"/>
         <setting id="source_priority" type="enum" label="Source preference" values="Remux|BluRay encode|WEB|Any" default="0"/>
+        <setting id="probe_av1_codec" type="bool" label="Probe resolved file metadata for AV1" default="true"/>
         <setting id="strict_title_matching" type="bool" label="Strict title matching (prefer no play over wrong title)" default="false"/>
         <setting id="tv_pack_preference" type="enum" label="TV pack preference" values="Prefer complete packs|Balanced|Allow singles" default="0"/>
     </category>
@@ -31,7 +32,7 @@
         <setting id="segment_debug_logging" type="bool" label="Verbose IntroDB/skip logging" default="false"/>
     </category>
     <category label="Cache">
-        <setting id="stream_cache_ttl_hours" type="number" label="Stream cache duration (hours)" default="6"/>
+        <setting id="stream_cache_ttl_hours" type="number" label="Stream cache duration (hours)" default="336"/>
         <setting id="notify_cache_hit" type="bool" label="Notify on cache hit" default="false"/>
         <setting id="clear_stream_cache" type="action" label="Clear stream cache" action="RunPlugin(plugin://plugin.video.kdmm/?action=clear_cache)"/>
     </category>

@@ -17,7 +17,7 @@ import time
 class StreamCache:
     """Cache for resolved stream URLs so we don't re-query every play."""
 
-    DEFAULT_TTL = 6 * 3600
+    DEFAULT_TTL = 14 * 24 * 3600
 
     def __init__(self, userdata_path, ttl=None):
         self._path = os.path.join(userdata_path, "stream_cache.json")
@@ -135,6 +135,77 @@ class PackBindingCache:
         else:
             self._data.clear()
         self._save()
+
+
+class BlockedHashCache:
+    """Cache torrent hashes that RD rejects with a hard legal block."""
+
+    DEFAULT_TTL = 30 * 24 * 3600
+
+    def __init__(self, userdata_path, ttl=None):
+        self._path = os.path.join(userdata_path, "blocked_hash_cache.json")
+        self._ttl = ttl if ttl is not None else self.DEFAULT_TTL
+        self._data = self._load()
+        self._prune()
+
+    def _load(self):
+        if os.path.isfile(self._path):
+            try:
+                with open(self._path, "r", encoding="utf-8") as fh:
+                    return json.load(fh)
+            except Exception:
+                pass
+        return {}
+
+    def _save(self):
+        os.makedirs(os.path.dirname(self._path), exist_ok=True)
+        with open(self._path, "w", encoding="utf-8") as fh:
+            json.dump(self._data, fh, indent=2)
+
+    def _prune(self):
+        now = time.time()
+        changed = False
+        for torrent_hash, entry in list(self._data.items()):
+            if now - entry.get("timestamp", 0) > self._ttl:
+                self._data.pop(torrent_hash, None)
+                changed = True
+        if changed:
+            self._save()
+
+    def is_blocked(self, torrent_hash):
+        torrent_hash = (torrent_hash or "").lower()
+        return bool(torrent_hash and torrent_hash in self._data)
+
+    def mark(self, torrent_hash, reason="rd_451"):
+        torrent_hash = (torrent_hash or "").lower()
+        if not torrent_hash:
+            return
+        self._data[torrent_hash] = {
+            "reason": reason,
+            "timestamp": time.time(),
+        }
+        self._save()
+
+    def mark_many(self, torrent_hashes, reason="rd_451"):
+        changed = False
+        now = time.time()
+        for torrent_hash in torrent_hashes or []:
+            torrent_hash = (torrent_hash or "").lower()
+            if not torrent_hash:
+                continue
+            self._data[torrent_hash] = {
+                "reason": reason,
+                "timestamp": now,
+            }
+            changed = True
+        if changed:
+            self._save()
+
+    def filter_unblocked(self, candidates):
+        return [
+            candidate for candidate in candidates
+            if not self.is_blocked(candidate.get("hash"))
+        ]
 
 
 class ProgressCache:

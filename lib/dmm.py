@@ -36,9 +36,20 @@ _MIN_STREAM_BYTES = 50 * 1024 * 1024  # 50 MB
 
 # Sentinel returned by _try_resolve_one when RD rejects with 401 (bad token)
 _RD_AUTH_FAILURE = object()
+_RD_BLOCKED_HASH_KEY = "blocked_hash"
 
 _VIDEO_EXTS = (".mkv", ".mp4", ".avi", ".m4v", ".webm", ".ts")
 _AV1_TOKEN_RE = re.compile(r"(^|[^a-z0-9])(?:av1|av01)([^a-z0-9]|$)", re.I)
+_CODEC_PROBE_BYTES = 2 * 1024 * 1024
+_AV1_CODEC_MARKERS = (b"av01", b"v_av1")
+_NON_AV1_CODEC_MARKERS = (
+    b"avc1", b"avc3", b"hvc1", b"hev1", b"dvh1", b"dvhe",
+    b"vp09", b"vp08", b"v_mpeg4/iso/avc", b"v_mpegh/iso/hevc",
+    b"v_mpeg4/iso/asp", b"v_mpeg2", b"v_vp8", b"v_vp9",
+)
+_RD_ADD_MAGNET_BATCH_SIZE = 1
+_RD_ADD_MAGNET_BATCH_PAUSE = 1.25
+_RD_ADD_MAGNET_429_BACKOFFS = (4.0, 8.0, 16.0, 32.0)
 _INSTALLMENT_TOKENS = {
     "ii", "iii", "iv", "v", "vi", "vii", "viii", "ix", "x",
     "2", "3", "4", "5", "6", "7", "8", "9", "10",
@@ -148,6 +159,10 @@ def is_av1_stream(value):
     treating unrelated words containing those letters as codec metadata.
     """
     if isinstance(value, dict):
+        if value.get("av1_probe") == "av1":
+            return True
+        if value.get("av1_probe") == "not_av1":
+            return False
         parts = [
             value.get("name"),
             value.get("title"),
@@ -156,6 +171,117 @@ def is_av1_stream(value):
         ]
         return any(is_av1_stream(part) for part in parts if part)
     return bool(_AV1_TOKEN_RE.search(str(value or "")))
+
+
+def _actual_av1_probe_enabled():
+    return _setting_bool("probe_av1_codec", True)
+
+
+def _skip_advertised_av1_before_resolve(value):
+    # When probing is enabled, text is only a fallback after the direct URL is available.
+    return not _actual_av1_probe_enabled() and is_av1_stream(value)
+
+
+def _read_url_sample(url, headers=None, start=0, size=_CODEC_PROBE_BYTES, timeout=4):
+    if not url or size <= 0:
+        return b""
+    req_headers = dict(headers or {})
+    req_headers["Range"] = f"bytes={start}-{start + size - 1}"
+    resp = None
+    try:
+        resp = _get_session().get(
+            url, headers=req_headers, timeout=timeout, stream=True, allow_redirects=True
+        )
+        if resp.status_code not in (200, 206):
+            return b""
+        chunks = []
+        remaining = size
+        for chunk in resp.iter_content(chunk_size=64 * 1024):
+            if not chunk:
+                continue
+            chunks.append(chunk[:remaining])
+            remaining -= len(chunks[-1])
+            if remaining <= 0:
+                break
+        return b"".join(chunks)
+    except Exception as exc:
+        _log(f"Codec probe sample failed: {exc}", xbmc.LOGWARNING)
+        return b""
+    finally:
+        if resp is not None:
+            try:
+                resp.close()
+            except Exception:
+                pass
+
+
+def _remote_content_length(url, headers=None, timeout=4):
+    try:
+        resp = _get_session().head(
+            url, headers=headers or {}, timeout=timeout, allow_redirects=True
+        )
+        length = int(resp.headers.get("content-length", -1))
+        if length >= 0:
+            return length
+    except Exception:
+        pass
+
+    resp = None
+    try:
+        resp = _get_session().get(
+            url,
+            headers={**(headers or {}), "Range": "bytes=0-0"},
+            timeout=timeout,
+            stream=True,
+            allow_redirects=True,
+        )
+        cr = resp.headers.get("content-range", "")
+        if "/" in cr:
+            return int(cr.split("/")[-1])
+    except Exception:
+        return -1
+    finally:
+        if resp is not None:
+            try:
+                resp.close()
+            except Exception:
+                pass
+    return -1
+
+
+def _detect_av1_from_codec_bytes(data):
+    lower = (data or b"").lower()
+    if any(marker in lower for marker in _AV1_CODEC_MARKERS):
+        return True
+    if any(marker in lower for marker in _NON_AV1_CODEC_MARKERS):
+        return False
+    return None
+
+
+def _probe_actual_av1_stream(url, headers=None):
+    """
+    Inspect real container metadata from a direct URL.
+
+    Returns True for AV1, False for a known non-AV1 video codec, and None when
+    the remote file cannot be determined quickly. This avoids full downloads.
+    """
+    if not _actual_av1_probe_enabled():
+        return None
+
+    start_sample = _read_url_sample(url, headers)
+    result = _detect_av1_from_codec_bytes(start_sample)
+    if result is not None:
+        return result
+
+    length = _remote_content_length(url, headers)
+    if length > _CODEC_PROBE_BYTES:
+        end_start = max(0, length - _CODEC_PROBE_BYTES)
+        end_sample = _read_url_sample(url, headers, start=end_start)
+        result = _detect_av1_from_codec_bytes(end_sample)
+        if result is not None:
+            return result
+
+    return None
 
 
 def _normalize_text(text):
@@ -629,7 +755,10 @@ def _filter_tv_results(results, show_title, season, episode, strict=False):
 
 
 def _filter_av1_results(results):
-    filtered = [result for result in results if not is_av1_stream(result.get("title", ""))]
+    filtered = [
+        result for result in results
+        if not _skip_advertised_av1_before_resolve(result.get("title", ""))
+    ]
     removed = len(results) - len(filtered)
     if removed:
         _log(f"AV1 filter: removed {removed} unsupported result(s)")
@@ -1052,15 +1181,17 @@ def _try_resolve_one(candidate, api_token, season, episode, cancel_event,
         if _cancelled(cancel_event):
             return None
 
-        # addMagnet with 429 retry
+        # addMagnet is RD's tightest rate-limited endpoint; keep retries slow.
         magnet = f"magnet:?xt=urn:btih:{candidate['hash']}"
-        for attempt in range(3):
+        for attempt in range(len(_RD_ADD_MAGNET_429_BACKOFFS) + 1):
             try:
                 resp = _rd_post("/torrents/addMagnet", api_token, data={"magnet": magnet})
                 break
             except Exception as e:
-                if "429" in str(e) and attempt < 2:
-                    _time.sleep(1.0 * (attempt + 1))
+                if "429" in str(e) and attempt < len(_RD_ADD_MAGNET_429_BACKOFFS):
+                    delay = _RD_ADD_MAGNET_429_BACKOFFS[attempt]
+                    _log(f"{h8} RD 429 - backing off {delay:.0f}s before retry", xbmc.LOGWARNING)
+                    _time.sleep(delay)
                     continue
                 raise
         rd_id = resp.get("id")
@@ -1076,7 +1207,7 @@ def _try_resolve_one(candidate, api_token, season, episode, cancel_event,
         status = info.get("status", "")
         _log(f"{h8} status: {status!r}")
 
-        if is_av1_stream(candidate.get("title")):
+        if _skip_advertised_av1_before_resolve(candidate.get("title")):
             _log(f"{h8} skipped AV1 candidate: {candidate.get('title')!r}", xbmc.LOGWARNING)
             _rd_delete(f"/torrents/delete/{rd_id}", api_token)
             return None
@@ -1094,7 +1225,7 @@ def _try_resolve_one(candidate, api_token, season, episode, cancel_event,
                 matches = []
                 for idx, f in enumerate(selected):
                     fname = f.get("path", "").lower()
-                    if is_av1_stream(fname):
+                    if _skip_advertised_av1_before_resolve(fname):
                         continue
                     if any(m in fname for m in ep_markers):
                         matches.append((idx, f))
@@ -1120,7 +1251,7 @@ def _try_resolve_one(candidate, api_token, season, episode, cancel_event,
                 fname = f.get("path", "").lower()
                 if not any(fname.endswith(e) for e in _VIDEO_EXTS):
                     continue
-                if is_av1_stream(fname):
+                if _skip_advertised_av1_before_resolve(fname):
                     continue
                 if ep_markers and not any(m in fname for m in ep_markers):
                     continue
@@ -1140,7 +1271,7 @@ def _try_resolve_one(candidate, api_token, season, episode, cancel_event,
                     fname = f.get("path", "").lower()
                     fsize = f.get("bytes", 0)
                     if (any(fname.endswith(e) for e in _VIDEO_EXTS)
-                            and not is_av1_stream(fname)
+                            and not _skip_advertised_av1_before_resolve(fname)
                             and fsize > best_size):
                         best_size = fsize
                         best_file_id = f.get("id")
@@ -1183,12 +1314,19 @@ def _try_resolve_one(candidate, api_token, season, episode, cancel_event,
         filename = unrestrict.get("filename", candidate.get("title", "Stream"))
         _rd_delete(f"/torrents/delete/{rd_id}", api_token)
 
-        if is_av1_stream(filename) or is_av1_stream(url):
+        av1_probe = _probe_actual_av1_stream(url)
+        if av1_probe is True:
+            _log(f"{h8} resolved AV1 stream skipped by codec probe: {filename!r}", xbmc.LOGWARNING)
+            return None
+        if av1_probe is None and (is_av1_stream(filename) or is_av1_stream(url)):
             _log(f"{h8} resolved AV1 stream skipped: {filename!r}", xbmc.LOGWARNING)
             return None
 
         if url:
-            _log(f"{h8} resolved: {filename!r}")
+            if av1_probe is False:
+                _log(f"{h8} codec probe verified non-AV1: {filename!r}")
+            else:
+                _log(f"{h8} codec probe inconclusive; allowing: {filename!r}")
             return {
                 "url": url,
                 "headers": {},
@@ -1197,6 +1335,7 @@ def _try_resolve_one(candidate, api_token, season, episode, cancel_event,
                 "title": candidate.get("title", ""),
                 "pack_scope": candidate.get("pack_scope", ""),
                 "pack_rank": candidate.get("pack_rank"),
+                "av1_probe": "not_av1" if av1_probe is False else "unknown",
             }
         return None
 
@@ -1204,8 +1343,13 @@ def _try_resolve_one(candidate, api_token, season, episode, cancel_event,
         # 401 means the token is invalid/expired — signal this distinctly so
         # the caller can stop immediately and prompt for re-authorization.
         if "401" in str(exc):
-            _log(f"{h8} RD 401 – token rejected", xbmc.LOGWARNING)
+            _log(f"{h8} RD 401 - token rejected", xbmc.LOGWARNING)
             return _RD_AUTH_FAILURE
+        if "451" in str(exc):
+            _log(f"{h8} RD 451 - marking hash as blocked", xbmc.LOGWARNING)
+            if rd_id:
+                _rd_delete(f"/torrents/delete/{rd_id}", api_token)
+            return {_RD_BLOCKED_HASH_KEY: candidate.get("hash")}
         _log(f"{h8} failed: {exc}", xbmc.LOGWARNING)
         if rd_id:
             _rd_delete(f"/torrents/delete/{rd_id}", api_token)
@@ -1214,10 +1358,10 @@ def _try_resolve_one(candidate, api_token, season, episode, cancel_event,
 
 def _resolve_by_direct_add(candidates_info, api_token, season=None, episode=None,
                            max_resolve=1, cancel_event=None, query_title=None,
-                           year=None):
+                           year=None, blocked_hashes=None):
     """
     Resolve streams by adding magnets to RD and checking for instant cache.
-    Runs candidates in PARALLEL in batches of 3 (to avoid RD 429 rate-limits),
+    Runs candidates in small batches to avoid RD 429 rate-limits,
     returns as soon as max_resolve streams are found.
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -1234,10 +1378,11 @@ def _resolve_by_direct_add(candidates_info, api_token, season=None, episode=None
 
     combined = _CombinedEvent()
 
-    _log(f"Resolving {len(candidates_info)} candidates in batches of 3 (need {max_resolve})")
+    batch_size = _RD_ADD_MAGNET_BATCH_SIZE
+    _log(f"Resolving {len(candidates_info)} candidates in batches of {batch_size} (need {max_resolve})")
 
-    # Process in batches of 3 to avoid RD rate limits
-    batch_size = 3
+    # RD often rate-limits addMagnet when probed in parallel, especially after
+    # many 451 responses, so this intentionally defaults to serial probing.
     for batch_start in range(0, len(candidates_info), batch_size):
         if _cancelled(cancel_event) or enough_event.is_set():
             break
@@ -1260,6 +1405,9 @@ def _resolve_by_direct_add(candidates_info, api_token, season=None, episode=None
                     # Count auth failures; if the whole first batch fails with 401
                     # the token is bad — abort immediately and signal re-auth needed.
                     pass  # counted below after batch drains
+                elif isinstance(result, dict) and result.get(_RD_BLOCKED_HASH_KEY):
+                    if blocked_hashes is not None:
+                        blocked_hashes.append(result[_RD_BLOCKED_HASH_KEY])
                 elif result:
                     resolved.append(result)
                     if len(resolved) >= max_resolve:
@@ -1291,9 +1439,9 @@ def _resolve_by_direct_add(candidates_info, api_token, season=None, episode=None
         if enough_event.is_set():
             break
 
-        # Small stagger between batches to avoid 429
+        # Stagger addMagnet calls to stay below RD's burst throttle.
         if batch_start + batch_size < len(candidates_info):
-            _time.sleep(0.3)
+            _time.sleep(_RD_ADD_MAGNET_BATCH_PAUSE)
 
     return resolved
 
@@ -1423,6 +1571,14 @@ def fetch_all_cached_streams(catalog_type, video_id, cancel_event=None,
     episode = parts[2] if len(parts) > 2 else None
     strict_matching, tv_pack_preference = _get_matching_preferences()
     pack_cache = None
+    blocked_cache = None
+    if userdata_path:
+        try:
+            from cache import BlockedHashCache
+            blocked_cache = BlockedHashCache(userdata_path)
+        except Exception as exc:
+            _log(f"Blocked hash cache unavailable: {exc}", xbmc.LOGWARNING)
+
     if catalog_type != "movie" and userdata_path:
         try:
             from cache import PackBindingCache
@@ -1433,7 +1589,7 @@ def fetch_all_cached_streams(catalog_type, video_id, cancel_event=None,
     if pack_cache and not ignore_pack_binding:
         binding = pack_cache.get(imdb_id, season)
         if binding:
-            if is_av1_stream(binding.get("title")):
+            if _skip_advertised_av1_before_resolve(binding.get("title")):
                 _log(f"Clearing AV1 bound pack for {imdb_id} S{int(season):02d}: "
                      f"{binding.get('title')!r}", xbmc.LOGWARNING)
                 pack_cache.clear(imdb_id, season)
@@ -1446,18 +1602,27 @@ def fetch_all_cached_streams(catalog_type, video_id, cancel_event=None,
                 "pack_rank": 1,
             }
             if len(bound_candidate["hash"]) == 40:
-                _log(f"Trying bound pack for {imdb_id} S{int(season):02d}: "
-                     f"{bound_candidate['hash'][:8]} {bound_candidate['title']!r}")
-                resolved = _resolve_by_direct_add(
-                    [bound_candidate], api_token, season=season, episode=episode,
-                    max_resolve=1, cancel_event=cancel_event,
-                    query_title=query_title, year=year,
-                )
-                if resolved:
-                    return resolved
-                _log(f"Bound pack failed for {imdb_id} S{int(season):02d}; clearing binding",
-                     xbmc.LOGWARNING)
-                pack_cache.clear(imdb_id, season)
+                if blocked_cache and blocked_cache.is_blocked(bound_candidate["hash"]):
+                    _log(f"Bound pack is RD-451 blocked; clearing binding for {imdb_id} S{int(season):02d}",
+                         xbmc.LOGWARNING)
+                    pack_cache.clear(imdb_id, season)
+                    binding = None
+                else:
+                    blocked_hashes = []
+                    _log(f"Trying bound pack for {imdb_id} S{int(season):02d}: "
+                         f"{bound_candidate['hash'][:8]} {bound_candidate['title']!r}")
+                    resolved = _resolve_by_direct_add(
+                        [bound_candidate], api_token, season=season, episode=episode,
+                        max_resolve=1, cancel_event=cancel_event,
+                        query_title=query_title, year=year, blocked_hashes=blocked_hashes,
+                    )
+                    if blocked_cache and blocked_hashes:
+                        blocked_cache.mark_many(blocked_hashes)
+                    if resolved:
+                        return resolved
+                    _log(f"Bound pack failed for {imdb_id} S{int(season):02d}; clearing binding",
+                         xbmc.LOGWARNING)
+                    pack_cache.clear(imdb_id, season)
 
     # 1. Get all hashes from DMM
     try:
@@ -1541,9 +1706,13 @@ def fetch_all_cached_streams(catalog_type, video_id, cancel_event=None,
              f"[hdr={parsed['hdr']} res={parsed['res']} src={parsed['src']} grp={parsed['group']}{extra}]")
 
     candidates = []
+    skipped_blocked = 0
     for r in sorted_dmm:
         h = (r.get("hash") or "").lower()
         if len(h) != 40:
+            continue
+        if blocked_cache and blocked_cache.is_blocked(h):
+            skipped_blocked += 1
             continue
         candidate = {"hash": h, "title": r.get("title", "Unknown")}
         if catalog_type != "movie":
@@ -1551,16 +1720,33 @@ def fetch_all_cached_streams(catalog_type, video_id, cancel_event=None,
             candidate["pack_rank"] = pack_rank
             candidate["pack_scope"] = pack_scope
         candidates.append(candidate)
-        if len(candidates) >= 20:
+
+    if skipped_blocked:
+        _log(f"Skipped {skipped_blocked} previously RD-451-blocked hash(es)")
+
+    _log(f"DMM returned {len(hash_map)} hashes, checking {len(candidates)} unblocked candidate(s) on RD")
+
+    resolved = []
+    page_size = 20
+    for page_start in range(0, len(candidates), page_size):
+        if _cancelled(cancel_event):
             break
 
-    _log(f"DMM returned {len(hash_map)} hashes, checking top {len(candidates)} in parallel on RD")
-
-    resolved = _resolve_by_direct_add(
-        candidates, api_token, season=season, episode=episode,
-        max_resolve=1, cancel_event=cancel_event,
-        query_title=query_title, year=year,
-    )
+        page = candidates[page_start:page_start + page_size]
+        _log(f"RD search page {page_start // page_size + 1}: "
+             f"candidates {page_start + 1}-{page_start + len(page)}")
+        blocked_hashes = []
+        resolved = _resolve_by_direct_add(
+            page, api_token, season=season, episode=episode,
+            max_resolve=1, cancel_event=cancel_event,
+            query_title=query_title, year=year,
+            blocked_hashes=blocked_hashes,
+        )
+        if blocked_cache and blocked_hashes:
+            blocked_cache.mark_many(blocked_hashes)
+            _log(f"Marked {len(blocked_hashes)} RD-451-blocked hash(es)")
+        if resolved:
+            break
 
     if not resolved:
         xbmcgui.Dialog().notification(
