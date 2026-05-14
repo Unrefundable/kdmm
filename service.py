@@ -82,6 +82,7 @@ PROP_MEDIA_ID = "kdmm.media_id"
 PROP_RESUME_TIME = "kdmm.resume_time"
 PROP_CANDIDATES = "kdmm.candidates"
 PROP_PLAYBACK_CONTEXT = "kdmm.playback_context"
+PROP_NEXT_EPISODE_TRANSITION = "kdmm.next_episode_transition"
 
 WATCHED_MARGIN_SECONDS = 60
 MIN_CONTENT_SECONDS = 60
@@ -171,9 +172,12 @@ class SegmentController:
         if filename != self._current_file:
             self.reset()
             self._current_file = filename
+            WIN.clearProperty(PROP_NEXT_EPISODE_TRANSITION)
             _log(f"Segment tracking reset for file: {filename}")
 
         context = player._playback_context or {}
+        if WIN.getProperty(PROP_NEXT_EPISODE_TRANSITION):
+            return
         current_time = player._last_known_time if player._last_known_time > 0 else self._safe_get_time(player)
         total_time = player._last_known_total if player._last_known_total > 0 else self._safe_get_total(player)
         if total_time <= 0:
@@ -224,7 +228,9 @@ class SegmentController:
                 )
                 if pressed:
                     _log(f"Opening next episode S{next_episode['season']}E{next_episode['episode']}")
-                    play_next_episode(next_episode)
+                    WIN.setProperty(PROP_NEXT_EPISODE_TRANSITION, "1")
+                    if not play_next_episode(next_episode):
+                        WIN.clearProperty(PROP_NEXT_EPISODE_TRANSITION)
                 continue
 
             pressed = show_skip_overlay(
@@ -308,7 +314,9 @@ class SegmentController:
         )
         if pressed:
             _log(f"Opening fallback next episode S{next_episode['season']}E{next_episode['episode']}")
-            play_next_episode(next_episode)
+            WIN.setProperty(PROP_NEXT_EPISODE_TRANSITION, "1")
+            if not play_next_episode(next_episode):
+                WIN.clearProperty(PROP_NEXT_EPISODE_TRANSITION)
 
     @staticmethod
     def _safe_get_time(player):
@@ -371,6 +379,7 @@ class BridgePlayer(xbmc.Player):
         except Exception:
             pass
         WIN.clearProperty(PROP_MEDIA_ID)
+        WIN.clearProperty(PROP_NEXT_EPISODE_TRANSITION)
 
         resume_str = WIN.getProperty(PROP_RESUME_TIME)
         WIN.clearProperty(PROP_RESUME_TIME)
@@ -457,7 +466,9 @@ class BridgePlayer(xbmc.Player):
             _log(
                 f"Auto-playing next episode S{next_episode['season']}E{next_episode['episode']}"
             )
+            WIN.setProperty(PROP_NEXT_EPISODE_TRANSITION, "1")
             if not play_next_episode(next_episode):
+                WIN.clearProperty(PROP_NEXT_EPISODE_TRANSITION)
                 _log("Automatic next-episode playback failed", xbmc.LOGWARNING)
 
         threading.Thread(target=_open, daemon=True).start()

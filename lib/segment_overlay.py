@@ -10,10 +10,12 @@ import xbmcvfs
 
 ADDON = xbmcaddon.Addon()
 ADDON_PATH = ADDON.getAddonInfo("path")
+WIN = xbmcgui.Window(10000)
 OVERLAY_RES = "1080i"
 BUTTON_ID = 3001
 BG_IMAGE_SHADOW = 3003
 BG_IMAGE_FILL = 3004
+PROP_NEXT_EPISODE_TRANSITION = "kdmm.next_episode_transition"
 ACTION_SELECT = 7
 ACTION_PREVIOUS_MENU = 10
 ACTION_BACK = 92
@@ -110,6 +112,12 @@ class SkipOverlay(xbmcgui.WindowXMLDialog):
                 return
             self._skip_pressed = True
             self._closed = True
+        if self._segment_type == "next_episode":
+            WIN.setProperty(PROP_NEXT_EPISODE_TRANSITION, "1")
+            try:
+                self.getControl(BUTTON_ID).setVisible(False)
+            except Exception:
+                pass
         if self._callback:
             try:
                 self._callback()
@@ -127,6 +135,9 @@ class SkipOverlay(xbmcgui.WindowXMLDialog):
                 self._close_from_thread()
                 return
             try:
+                if self._segment_type == "next_episode" and WIN.getProperty(PROP_NEXT_EPISODE_TRANSITION):
+                    self._close_from_thread()
+                    return
                 if self._display_deadline is not None and time.time() >= self._display_deadline:
                     self._close_from_thread()
                     return

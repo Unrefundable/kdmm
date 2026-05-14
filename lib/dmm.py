@@ -47,9 +47,9 @@ _NON_AV1_CODEC_MARKERS = (
     b"vp09", b"vp08", b"v_mpeg4/iso/avc", b"v_mpegh/iso/hevc",
     b"v_mpeg4/iso/asp", b"v_mpeg2", b"v_vp8", b"v_vp9",
 )
-_RD_ADD_MAGNET_BATCH_SIZE = 1
-_RD_ADD_MAGNET_BATCH_PAUSE = 1.25
-_RD_ADD_MAGNET_429_BACKOFFS = (4.0, 8.0, 16.0, 32.0)
+_RD_ADD_MAGNET_BATCH_SIZE = 3
+_RD_ADD_MAGNET_BATCH_PAUSE = 0.35
+_RD_ADD_MAGNET_429_BACKOFFS = (1.5, 3.0, 6.0)
 _INSTALLMENT_TOKENS = {
     "ii", "iii", "iv", "v", "vi", "vii", "viii", "ix", "x",
     "2", "3", "4", "5", "6", "7", "8", "9", "10",
@@ -180,6 +180,10 @@ def _actual_av1_probe_enabled():
 def _skip_advertised_av1_before_resolve(value):
     # When probing is enabled, text is only a fallback after the direct URL is available.
     return not _actual_av1_probe_enabled() and is_av1_stream(value)
+
+
+def _av1_text_rank(value):
+    return 1 if is_av1_stream(value) else 0
 
 
 def _read_url_sample(url, headers=None, start=0, size=_CODEC_PROBE_BYTES, timeout=4):
@@ -1236,7 +1240,8 @@ def _try_resolve_one(candidate, api_token, season, episode, cancel_event,
                 if matches:
                     ep_link_idx, best_file = min(
                         matches,
-                        key=lambda item: _episode_file_sort_key(
+                        key=lambda item: (_av1_text_rank(item[1].get("path", "")),)
+                        + _episode_file_sort_key(
                             item[1], query_title, season, episode, year
                         ),
                     )
@@ -1259,21 +1264,22 @@ def _try_resolve_one(candidate, api_token, season, episode, cancel_event,
             if episode_files:
                 best_file = min(
                     episode_files,
-                    key=lambda f: _episode_file_sort_key(
+                    key=lambda f: (_av1_text_rank(f.get("path", "")),)
+                    + _episode_file_sort_key(
                         f, query_title, season, episode, year
                     ),
                 )
                 best_file_id = best_file.get("id")
             # Second pass: any video file
             if not best_file_id:
-                best_size = 0
+                best_rank = None
                 for f in files:
                     fname = f.get("path", "").lower()
                     fsize = f.get("bytes", 0)
                     if (any(fname.endswith(e) for e in _VIDEO_EXTS)
                             and not _skip_advertised_av1_before_resolve(fname)
-                            and fsize > best_size):
-                        best_size = fsize
+                            and (best_rank is None or (_av1_text_rank(fname), -fsize) < best_rank)):
+                        best_rank = (_av1_text_rank(fname), -fsize)
                         best_file_id = f.get("id")
             if not best_file_id:
                 _log(f"{h8} no non-AV1 video file in {len(files)} files")
@@ -1705,7 +1711,8 @@ def fetch_all_cached_streams(catalog_type, video_id, cancel_event=None,
         _log(f"  #{i+1}: {r.get('title','?')[:80]} "
              f"[hdr={parsed['hdr']} res={parsed['res']} src={parsed['src']} grp={parsed['group']}{extra}]")
 
-    candidates = []
+    primary_candidates = []
+    fallback_candidates = []
     skipped_blocked = 0
     for r in sorted_dmm:
         h = (r.get("hash") or "").lower()
@@ -1719,10 +1726,20 @@ def fetch_all_cached_streams(catalog_type, video_id, cancel_event=None,
             pack_rank, pack_scope = _tv_pack_rank(r, season, episode)
             candidate["pack_rank"] = pack_rank
             candidate["pack_scope"] = pack_scope
-        candidates.append(candidate)
+        if is_av1_stream(candidate.get("title")):
+            fallback_candidates.append(candidate)
+        else:
+            primary_candidates.append(candidate)
 
     if skipped_blocked:
         _log(f"Skipped {skipped_blocked} previously RD-451-blocked hash(es)")
+
+    candidates = primary_candidates + fallback_candidates
+    if fallback_candidates:
+        _log(
+            f"Deferring {len(fallback_candidates)} title-advertised AV1 candidate(s) "
+            "until non-advertised candidates are exhausted"
+        )
 
     _log(f"DMM returned {len(hash_map)} hashes, checking {len(candidates)} unblocked candidate(s) on RD")
 
