@@ -159,6 +159,23 @@ def _filter_playable_candidates(candidates):
     return filtered
 
 
+def _wait_for_fetch(thread, cancel_event):
+    busy_dialog = xbmcgui.DialogProgress()
+    busy_dialog.create("KDMM", "Finding best stream…")
+    dots = 0
+    try:
+        while thread.is_alive():
+            if busy_dialog.iscanceled():
+                cancel_event.set()
+                return False
+            dots = (dots + 1) % 4
+            busy_dialog.update(0, f"Finding best stream{'.' * dots}")
+            xbmc.sleep(500)
+        return True
+    finally:
+        busy_dialog.close()
+
+
 # ------------------------------------------------------------------ #
 # Actions
 # ------------------------------------------------------------------ #
@@ -196,7 +213,7 @@ def action_play(params):
         )
         return
 
-    ttl_hours = int(_ADDON.getSetting("stream_cache_ttl_hours") or "6")
+    ttl_hours = int(_ADDON.getSetting("stream_cache_ttl_hours") or "336")
     stream_cache = StreamCache(_USERDATA_PATH, ttl=ttl_hours * 3600)
     pack_cache = PackBindingCache(_USERDATA_PATH)
     bound_pack = pack_cache.get(imdb, season) if catalog_type == "series" else None
@@ -252,19 +269,9 @@ def action_play(params):
         t = threading.Thread(target=_fetch, daemon=True)
         t.start()
 
-        busy_dialog = xbmcgui.DialogProgress()
-        busy_dialog.create("KDMM", "Finding best stream…")
-        dots = 0
-        while t.is_alive():
-            if busy_dialog.iscanceled():
-                cancel_event.set()
-                busy_dialog.close()
-                xbmcplugin.setResolvedUrl(ADDON_HANDLE, False, xbmcgui.ListItem())
-                return
-            dots = (dots + 1) % 4
-            busy_dialog.update(0, f"Finding best stream{'.' * dots}")
-            xbmc.sleep(500)
-        busy_dialog.close()
+        if not _wait_for_fetch(t, cancel_event):
+            xbmcplugin.setResolvedUrl(ADDON_HANDLE, False, xbmcgui.ListItem())
+            return
 
         # Auth token missing or expired — prompt user to re-authorize (must run on main thread)
         if fetch_result.get("needs_auth"):
@@ -282,19 +289,9 @@ def action_play(params):
                     cancel_event.clear()
                     t2 = threading.Thread(target=_fetch, daemon=True)
                     t2.start()
-                    busy_dialog2 = xbmcgui.DialogProgress()
-                    busy_dialog2.create("KDMM", "Finding best stream…")
-                    dots = 0
-                    while t2.is_alive():
-                        if busy_dialog2.iscanceled():
-                            cancel_event.set()
-                            busy_dialog2.close()
-                            xbmcplugin.setResolvedUrl(ADDON_HANDLE, False, xbmcgui.ListItem())
-                            return
-                        dots = (dots + 1) % 4
-                        busy_dialog2.update(0, f"Finding best stream{'.' * dots}")
-                        xbmc.sleep(500)
-                    busy_dialog2.close()
+                    if not _wait_for_fetch(t2, cancel_event):
+                        xbmcplugin.setResolvedUrl(ADDON_HANDLE, False, xbmcgui.ListItem())
+                        return
                 else:
                     xbmcplugin.setResolvedUrl(ADDON_HANDLE, False, xbmcgui.ListItem())
                     return
