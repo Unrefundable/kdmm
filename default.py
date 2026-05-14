@@ -160,20 +160,24 @@ def _filter_playable_candidates(candidates):
 
 
 def _wait_for_fetch(thread, cancel_event):
-    busy_dialog = xbmcgui.DialogProgress()
-    busy_dialog.create("KDMM", "Finding best stream…")
-    dots = 0
+    xbmc.executebuiltin("ActivateWindow(busydialog)")
+    xbmc.sleep(100)
+    started = False
     try:
         while thread.is_alive():
-            if busy_dialog.iscanceled():
+            visible = (
+                xbmc.getCondVisibility("Window.IsActive(busydialog)")
+                or xbmc.getCondVisibility("Window.IsVisible(busydialog)")
+            )
+            if visible:
+                started = True
+            elif started:
                 cancel_event.set()
                 return False
-            dots = (dots + 1) % 4
-            busy_dialog.update(0, f"Finding best stream{'.' * dots}")
-            xbmc.sleep(500)
+            xbmc.sleep(200)
         return True
     finally:
-        busy_dialog.close()
+        xbmc.executebuiltin("Dialog.Close(busydialog,true)")
 
 
 # ------------------------------------------------------------------ #
