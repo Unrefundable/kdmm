@@ -51,6 +51,7 @@ sys.path.insert(0, os.path.join(_ADDON_PATH, "lib"))
 from cache import StreamCache, ProgressCache, PackBindingCache        # noqa: E402 (after sys.path)
 from dmm import fetch_all_cached_streams, is_av1_stream, is_stream_accessible    # noqa: E402
 from playback import apply_playback_metadata, build_playback_context, encode_playback_context  # noqa: E402
+from ad_auth import authorize as ad_authorize, revoke as ad_revoke  # noqa: E402
 from rd_auth import authorize as rd_authorize, revoke as rd_revoke  # noqa: E402
 from settings_persistence import get_stream_cache_ttl_hours  # noqa: E402
 
@@ -179,6 +180,18 @@ def _cache_needs_refresh(cached):
     return any(_candidate_has_probe_consumed_url(c) for c in candidates if isinstance(c, dict))
 
 
+def _authorize_debrid_account():
+    choice = xbmcgui.Dialog().select(
+        "KDMM - Authorization Required",
+        ["Authorize Real-Debrid", "Authorize AllDebrid", "Cancel"],
+    )
+    if choice == 0:
+        return rd_authorize()
+    if choice == 1:
+        return ad_authorize()
+    return False
+
+
 def _wait_for_fetch(thread, cancel_event):
     xbmc.executebuiltin("ActivateWindow(busydialog)")
     xbmc.sleep(100)
@@ -274,9 +287,9 @@ def action_play(params):
                             xbmcgui.NOTIFICATION_INFO, 2000,
                         )
 
-    # ---- 2. Fetch fresh from DMM + RD if needed -------------------- #
+    # ---- 2. Fetch fresh from DMM + debrid if needed ---------------- #
     if candidates is None:
-        _log(f"Cache miss – querying DMM + RD for {media_id}")
+        _log(f"Cache miss – querying DMM + debrid for {media_id}")
         if force_refresh and catalog_type == "series":
             pack_cache.clear(imdb, season)
 
@@ -302,17 +315,17 @@ def action_play(params):
             xbmcplugin.setResolvedUrl(ADDON_HANDLE, False, xbmcgui.ListItem())
             return
 
-        # Auth token missing or expired — prompt user to re-authorize (must run on main thread)
+        # Auth token missing or expired — prompt user to authorize a provider (main thread)
         if fetch_result.get("needs_auth"):
-            _log("No RD token – prompting user to re-authorize")
+            _log("No debrid token – prompting user to authorize")
             if xbmcgui.Dialog().yesno(
                 "KDMM – Authorization Required",
-                "Your Real-Debrid authorization has expired.[CR]"
-                "Authorize now to continue watching?",
-                yeslabel="Authorize (QR code)",
+                "No valid Real-Debrid or AllDebrid authorization is configured.[CR]"
+                "Authorize a debrid account now to continue watching?",
+                yeslabel="Authorize",
                 nolabel="Cancel",
             ):
-                if rd_authorize():
+                if _authorize_debrid_account():
                     # Re-run the fetch now that we have a fresh token
                     fetch_result.clear()
                     cancel_event.clear()
@@ -329,7 +342,7 @@ def action_play(params):
                 return
             if fetch_result.get("needs_auth"):
                 xbmcgui.Dialog().notification(
-                    "KDMM", "Still no token after re-auth. Check addon settings.",
+                    "KDMM", "Still no debrid token after auth. Check addon settings.",
                     xbmcgui.NOTIFICATION_ERROR, 8000)
                 xbmcplugin.setResolvedUrl(ADDON_HANDLE, False, xbmcgui.ListItem())
                 return
@@ -482,6 +495,12 @@ def addon_router():
         rd_revoke()
         xbmcgui.Dialog().notification("KDMM", "Real-Debrid authorization revoked",
                                        xbmcgui.NOTIFICATION_INFO)
+    elif action == "authorize_ad":
+        ad_authorize()
+    elif action == "revoke_ad":
+        ad_revoke()
+        xbmcgui.Dialog().notification("KDMM", "AllDebrid authorization revoked",
+                                      xbmcgui.NOTIFICATION_INFO)
     elif action == "clear_cache":
         action_clear_cache(params)
     elif action == "clear_progress":
