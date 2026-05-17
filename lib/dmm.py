@@ -1318,17 +1318,30 @@ def _try_resolve_one(candidate, api_token, season, episode, cancel_event,
                                data={"link": link_to_use})
         url = unrestrict.get("download")
         filename = unrestrict.get("filename", candidate.get("title", "Stream"))
-        _rd_delete(f"/torrents/delete/{rd_id}", api_token)
 
         av1_probe = _probe_actual_av1_stream(url)
         if av1_probe is True:
             _log(f"{h8} resolved AV1 stream skipped by codec probe: {filename!r}", xbmc.LOGWARNING)
+            _rd_delete(f"/torrents/delete/{rd_id}", api_token)
+            rd_id = None
             return None
         if av1_probe is None and (is_av1_stream(filename) or is_av1_stream(url)):
             _log(f"{h8} resolved AV1 stream skipped: {filename!r}", xbmc.LOGWARNING)
+            _rd_delete(f"/torrents/delete/{rd_id}", api_token)
+            rd_id = None
             return None
 
         if url:
+            url_refreshed = False
+            if _actual_av1_probe_enabled():
+                # Some RD direct URLs do not survive a metadata range probe.
+                # Get a fresh playback URL after probing so Kodi opens cleanly.
+                fresh = _rd_post("/unrestrict/link", api_token, data={"link": link_to_use})
+                url = fresh.get("download") or url
+                filename = fresh.get("filename", filename)
+                url_refreshed = True
+            _rd_delete(f"/torrents/delete/{rd_id}", api_token)
+            rd_id = None
             if av1_probe is False:
                 _log(f"{h8} codec probe verified non-AV1: {filename!r}")
             else:
@@ -1342,7 +1355,10 @@ def _try_resolve_one(candidate, api_token, season, episode, cancel_event,
                 "pack_scope": candidate.get("pack_scope", ""),
                 "pack_rank": candidate.get("pack_rank"),
                 "av1_probe": "not_av1" if av1_probe is False else "unknown",
+                "url_refreshed_after_probe": url_refreshed,
             }
+        _rd_delete(f"/torrents/delete/{rd_id}", api_token)
+        rd_id = None
         return None
 
     except Exception as exc:
@@ -1441,6 +1457,9 @@ def _resolve_by_direct_add(candidates_info, api_token, season=None, episode=None
         if non_none and all(r is _RD_AUTH_FAILURE for r in non_none):
             _log("All RD calls returned 401 – token is invalid, raising auth error", xbmc.LOGWARNING)
             raise PermissionError("rd_token_rejected")
+
+        if resolved:
+            break
 
         if enough_event.is_set():
             break
@@ -1755,7 +1774,7 @@ def fetch_all_cached_streams(catalog_type, video_id, cancel_event=None,
         blocked_hashes = []
         resolved = _resolve_by_direct_add(
             page, api_token, season=season, episode=episode,
-            max_resolve=1, cancel_event=cancel_event,
+            max_resolve=3, cancel_event=cancel_event,
             query_title=query_title, year=year,
             blocked_hashes=blocked_hashes,
         )
