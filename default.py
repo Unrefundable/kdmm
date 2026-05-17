@@ -22,6 +22,7 @@ import json
 import os
 import sys
 import threading
+import time
 from urllib.parse import parse_qsl, urlencode
 
 import xbmc
@@ -51,6 +52,7 @@ from cache import StreamCache, ProgressCache, PackBindingCache        # noqa: E4
 from dmm import fetch_all_cached_streams, is_av1_stream, is_stream_accessible    # noqa: E402
 from playback import apply_playback_metadata, build_playback_context, encode_playback_context  # noqa: E402
 from rd_auth import authorize as rd_authorize, revoke as rd_revoke  # noqa: E402
+from settings_persistence import get_stream_cache_ttl_hours  # noqa: E402
 
 # ------------------------------------------------------------------ #
 # Constants – window property keys shared with service.py
@@ -60,6 +62,7 @@ PROP_MEDIA_ID = "kdmm.media_id"
 PROP_RESUME_TIME = "kdmm.resume_time"
 PROP_CANDIDATES = "kdmm.candidates"   # JSON list of all cached stream candidates
 PROP_PLAYBACK_CONTEXT = "kdmm.playback_context"
+PROP_PENDING_PLAYBACK = "kdmm.pending_playback"
 
 
 def _log(msg, level=xbmc.LOGINFO):
@@ -132,6 +135,11 @@ def _play_stream(media_id, url, headers_dict, imdb, tmdb, title, showtitle,
     # Tell the service which item is playing so it can save progress later.
     WIN.setProperty(PROP_MEDIA_ID, media_id)
     WIN.setProperty(PROP_PLAYBACK_CONTEXT, encode_playback_context(playback_context))
+    WIN.setProperty(PROP_PENDING_PLAYBACK, json.dumps({
+        "media_id": media_id,
+        "url": url,
+        "timestamp": time.time(),
+    }))
 
     # Queue a resume seek via window property; service.py reads it in onAVStarted.
     progress_cache = ProgressCache(_USERDATA_PATH)
@@ -157,6 +165,18 @@ def _filter_playable_candidates(candidates):
     if removed:
         _log(f"Filtered {removed} cached/resolved AV1 candidate(s)", xbmc.LOGWARNING)
     return filtered
+
+
+def _candidate_has_probe_consumed_url(candidate):
+    return (
+        candidate.get("av1_probe") in ("not_av1", "unknown")
+        and not candidate.get("url_refreshed_after_probe")
+    )
+
+
+def _cache_needs_refresh(cached):
+    candidates = cached if isinstance(cached, list) else [cached]
+    return any(_candidate_has_probe_consumed_url(c) for c in candidates if isinstance(c, dict))
 
 
 def _wait_for_fetch(thread, cancel_event):
@@ -217,7 +237,7 @@ def action_play(params):
         )
         return
 
-    ttl_hours = int(_ADDON.getSetting("stream_cache_ttl_hours") or "336")
+    ttl_hours = get_stream_cache_ttl_hours(_USERDATA_PATH)
     stream_cache = StreamCache(_USERDATA_PATH, ttl=ttl_hours * 3600)
     pack_cache = PackBindingCache(_USERDATA_PATH)
     bound_pack = pack_cache.get(imdb, season) if catalog_type == "series" else None
@@ -227,27 +247,32 @@ def action_play(params):
     if not force_refresh:
         cached = stream_cache.get(media_id)
         if cached:
-            cached_hash = ""
-            if isinstance(cached, list) and cached:
-                cached_hash = (cached[0].get("hash") or "").lower()
-            if bound_pack and cached_hash != (bound_pack.get("hash") or "").lower():
-                _log(f"Bypassing stale episode cache for {media_id}; bound pack is {bound_pack.get('hash')}")
-            else:
-                _log(f"Cache hit for {media_id}")
-                candidates = _filter_playable_candidates(cached)
-                if not candidates:
-                    _log(f"Cached candidates for {media_id} were AV1 only; refreshing")
-                    stream_cache.clear(media_id)
-                    if catalog_type == "series":
-                        pack_cache.clear(imdb, season)
-                    candidates = None
-                    bound_pack = None
-                    cached = None
-                if cached and candidates and _ADDON.getSetting("notify_cache_hit").lower() == "true":
-                    xbmcgui.Dialog().notification(
-                        "KDMM", "Using cached stream",
-                        xbmcgui.NOTIFICATION_INFO, 2000,
-                    )
+            if _cache_needs_refresh(cached):
+                _log(f"Refreshing {media_id}; cached URL may have been consumed by codec probe")
+                stream_cache.clear(media_id)
+                cached = None
+            if cached:
+                cached_hash = ""
+                if isinstance(cached, list) and cached:
+                    cached_hash = (cached[0].get("hash") or "").lower()
+                if bound_pack and cached_hash != (bound_pack.get("hash") or "").lower():
+                    _log(f"Bypassing stale episode cache for {media_id}; bound pack is {bound_pack.get('hash')}")
+                else:
+                    _log(f"Cache hit for {media_id}")
+                    candidates = _filter_playable_candidates(cached)
+                    if not candidates:
+                        _log(f"Cached candidates for {media_id} were AV1 only; refreshing")
+                        stream_cache.clear(media_id)
+                        if catalog_type == "series":
+                            pack_cache.clear(imdb, season)
+                        candidates = None
+                        bound_pack = None
+                        cached = None
+                    if cached and candidates and _ADDON.getSetting("notify_cache_hit").lower() == "true":
+                        xbmcgui.Dialog().notification(
+                            "KDMM", "Using cached stream",
+                            xbmcgui.NOTIFICATION_INFO, 2000,
+                        )
 
     # ---- 2. Fetch fresh from DMM + RD if needed -------------------- #
     if candidates is None:

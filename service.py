@@ -3,6 +3,7 @@
 import json
 import os
 import sys
+import time
 
 import xbmc
 import xbmcaddon
@@ -26,6 +27,7 @@ from introdb_client import query_all_segments  # noqa: E402
 from next_episode import get_next_episode, play_next_episode  # noqa: E402
 from playback import apply_playback_metadata, decode_playback_context  # noqa: E402
 from segment_overlay import show_skip_overlay  # noqa: E402
+from settings_persistence import get_stream_cache_ttl_hours  # noqa: E402
 
 # ------------------------------------------------------------------ #
 # One-time player JSON installer
@@ -83,9 +85,11 @@ PROP_RESUME_TIME = "kdmm.resume_time"
 PROP_CANDIDATES = "kdmm.candidates"
 PROP_PLAYBACK_CONTEXT = "kdmm.playback_context"
 PROP_NEXT_EPISODE_TRANSITION = "kdmm.next_episode_transition"
+PROP_PENDING_PLAYBACK = "kdmm.pending_playback"
 
 WATCHED_MARGIN_SECONDS = 60
 MIN_CONTENT_SECONDS = 60
+PLAYBACK_START_TIMEOUT_SECONDS = 8
 SEGMENT_END_MARGIN_SECONDS = 0.25
 NEXT_EPISODE_FALLBACK_SECONDS = 45
 POST_CREDITS_SCENE_MIN_SECONDS = 20
@@ -360,6 +364,27 @@ class BridgePlayer(xbmc.Player):
                     self._last_known_total = total
             except Exception:
                 pass
+        self._check_pending_playback_start()
+
+    def _check_pending_playback_start(self):
+        pending_json = WIN.getProperty(PROP_PENDING_PLAYBACK)
+        if not pending_json or self.isPlayingVideo():
+            return
+        try:
+            pending = json.loads(pending_json)
+        except Exception:
+            WIN.clearProperty(PROP_PENDING_PLAYBACK)
+            return
+        media_id = pending.get("media_id")
+        started_at = float(pending.get("timestamp") or 0)
+        if not media_id or time.time() - started_at < PLAYBACK_START_TIMEOUT_SECONDS:
+            return
+        url = (pending.get("url") or "").split("|")[0]
+        if url:
+            self._tried_urls.add(url)
+        WIN.clearProperty(PROP_PENDING_PLAYBACK)
+        _log(f"Playback did not start for {media_id}; trying next candidate", xbmc.LOGWARNING)
+        self._try_next_candidate(media_id)
 
     def onAVStarted(self):
         media_id = WIN.getProperty(PROP_MEDIA_ID)
@@ -379,6 +404,7 @@ class BridgePlayer(xbmc.Player):
         except Exception:
             pass
         WIN.clearProperty(PROP_MEDIA_ID)
+        WIN.clearProperty(PROP_PENDING_PLAYBACK)
         WIN.clearProperty(PROP_NEXT_EPISODE_TRANSITION)
 
         resume_str = WIN.getProperty(PROP_RESUME_TIME)
@@ -412,6 +438,7 @@ class BridgePlayer(xbmc.Player):
         self._current_media_id = None
         WIN.clearProperty(PROP_MEDIA_ID)
         WIN.clearProperty(PROP_RESUME_TIME)
+        WIN.clearProperty(PROP_PENDING_PLAYBACK)
 
         if not media_id:
             return
@@ -541,6 +568,11 @@ class BridgePlayer(xbmc.Player):
                 li.setProperty("inputstream", "inputstream.ffmpegdirect")
 
             WIN.setProperty(PROP_MEDIA_ID, media_id)
+            WIN.setProperty(PROP_PENDING_PLAYBACK, json.dumps({
+                "media_id": media_id,
+                "url": url,
+                "timestamp": time.time(),
+            }))
             _log(f"Retrying with next candidate: {next_stream['name']!r}")
             xbmc.sleep(800)
             self.play(final_url, li)
@@ -552,6 +584,7 @@ class BridgePlayer(xbmc.Player):
         if not media_id:
             return
         self._current_media_id = None
+        WIN.clearProperty(PROP_PENDING_PLAYBACK)
         WIN.clearProperty(PROP_PLAYBACK_CONTEXT)
         self._playback_context = {}
 
@@ -591,6 +624,7 @@ class BridgeMonitor(xbmc.Monitor):
             _install_player_json()
         except Exception as exc:
             _log(f"_install_player_json failed: {exc}", xbmc.LOGWARNING)
+        get_stream_cache_ttl_hours(_USERDATA_PATH)
         while not self.abortRequested():
             self.player.tick()
             self.segment_controller.tick(self.player, self)
