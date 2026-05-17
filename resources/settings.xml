@@ -1,9 +1,13 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <settings>
-    <category label="Real-Debrid">
+    <category label="Debrid Accounts">
+        <setting id="debrid_provider_order" type="enum" label="Provider priority" values="Real-Debrid first|AllDebrid first" default="0"/>
         <setting id="rd_api_key" type="text" label="API Key (from real-debrid.com/apitoken)" default="" option="hidden"/>
         <setting id="authorize_rd" type="action" label="Or: Authorize via device code (QR)" action="RunPlugin(plugin://plugin.video.kdmm/?action=authorize_rd)"/>
         <setting id="revoke_rd" type="action" label="Revoke Real-Debrid Authorization" action="RunPlugin(plugin://plugin.video.kdmm/?action=revoke_rd)"/>
+        <setting id="ad_api_key" type="text" label="AllDebrid API Key (from alldebrid.com/apikeys)" default="" option="hidden"/>
+        <setting id="authorize_ad" type="action" label="Authorize AllDebrid via PIN" action="RunPlugin(plugin://plugin.video.kdmm/?action=authorize_ad)"/>
+        <setting id="revoke_ad" type="action" label="Revoke AllDebrid Authorization" action="RunPlugin(plugin://plugin.video.kdmm/?action=revoke_ad)"/>
         <setting id="rd_client_id" type="text" label="" visible="false" default=""/>
         <setting id="rd_client_secret" type="text" label="" visible="false" default=""/>
         <setting id="rd_access_token" type="text" label="" visible="false" default=""/>

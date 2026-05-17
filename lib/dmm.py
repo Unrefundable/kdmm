@@ -1,13 +1,13 @@
 """
 KDMM – lib/dmm.py
-Debrid Media Manager torrent lookup + Real-Debrid stream resolver.
+Debrid Media Manager torrent lookup + debrid stream resolver.
 
 Flow:
   1.  Generate a DMM proof-of-work token (port of their JS generateTokenAndHash).
   2.  GET  debridmediamanager.com/api/torrents/movie (or tv)
       → returns every known torrent hash for the IMDB ID.
   3.  Sort candidates by preferred release groups + file size.
-  4.  For each candidate, check RD cache via direct-add:
+  4.  For each candidate, check debrid cache via direct-add:
         POST /torrents/addMagnet → GET /torrents/info →
         POST /torrents/selectFiles → check status == 'downloaded' →
         POST /unrestrict/link → direct CDN URL.
@@ -30,13 +30,17 @@ import xbmcvfs
 _DMM_SALT = "debridmediamanager.com%%fe7#td00rA3vHz%VmI"
 _DMM_BASE = "https://debridmediamanager.com"
 _RD_BASE = "https://api.real-debrid.com/rest/1.0"
+_AD_BASE = "https://api.alldebrid.com/v4"
+_AD_BASE_41 = "https://api.alldebrid.com/v4.1"
 
 # Minimum file size to distinguish real content from RD error clips.
 _MIN_STREAM_BYTES = 50 * 1024 * 1024  # 50 MB
 
-# Sentinel returned by _try_resolve_one when RD rejects with 401 (bad token)
-_RD_AUTH_FAILURE = object()
+_AUTH_FAILURE = object()
+_RD_AUTH_FAILURE = _AUTH_FAILURE
 _RD_BLOCKED_HASH_KEY = "blocked_hash"
+_PROVIDER_RD = "realdebrid"
+_PROVIDER_AD = "alldebrid"
 
 _VIDEO_EXTS = (".mkv", ".mp4", ".avi", ".m4v", ".webm", ".ts")
 _AV1_TOKEN_RE = re.compile(r"(^|[^a-z0-9])(?:av1|av01)([^a-z0-9]|$)", re.I)
@@ -984,6 +988,40 @@ def _rd_key():
     return get_access_token()
 
 
+def _ad_key():
+    """Return a configured AllDebrid API key, if available."""
+    from ad_auth import get_access_token
+    return get_access_token()
+
+
+def _provider_label(provider):
+    return "AllDebrid" if provider == _PROVIDER_AD else "Real-Debrid"
+
+
+def _provider_short(provider):
+    return "AD" if provider == _PROVIDER_AD else "RD"
+
+
+def _get_debrid_accounts():
+    """
+    Return configured debrid accounts in user-selected priority order.
+    Each entry is {"provider": ..., "token": ...}.
+    """
+    accounts = []
+    rd_token = _rd_key()
+    ad_token = _ad_key()
+    if rd_token:
+        accounts.append({"provider": _PROVIDER_RD, "token": rd_token})
+    if ad_token:
+        accounts.append({"provider": _PROVIDER_AD, "token": ad_token})
+
+    if _setting_int("debrid_provider_order", 0) == 1:
+        accounts.sort(key=lambda item: 0 if item["provider"] == _PROVIDER_AD else 1)
+    else:
+        accounts.sort(key=lambda item: 0 if item["provider"] == _PROVIDER_RD else 1)
+    return accounts
+
+
 def _validate_rd_token(api_token):
     """
     Verify the token is accepted by RD by calling GET /user.
@@ -1033,6 +1071,49 @@ def _rd_delete(path, api_token, timeout=5):
         s.delete(f"{_RD_BASE}{path}", headers=_rd_headers(api_token), timeout=timeout)
     except Exception:
         pass  # delete is best-effort cleanup
+
+
+def _ad_headers(api_token):
+    return {"Authorization": f"Bearer {api_token}"}
+
+
+def _ad_raise_for_payload(payload):
+    if isinstance(payload, dict) and payload.get("status") == "success":
+        return payload.get("data") or {}
+    error = (payload or {}).get("error") if isinstance(payload, dict) else {}
+    code = (error or {}).get("code", "")
+    message = (error or {}).get("message", "AllDebrid API error")
+    if code.startswith("AUTH_"):
+        raise PermissionError(code)
+    raise RuntimeError(f"{code}: {message}" if code else message)
+
+
+def _ad_get(path, api_token, timeout=6):
+    s = _get_session()
+    r = s.get(f"{_AD_BASE}{path}", headers=_ad_headers(api_token), timeout=timeout)
+    r.raise_for_status()
+    return _ad_raise_for_payload(r.json())
+
+
+def _ad_post(path, api_token, data=None, timeout=6, base=None):
+    s = _get_session()
+    r = s.post(
+        f"{base or _AD_BASE}{path}",
+        headers=_ad_headers(api_token),
+        data=data or {},
+        timeout=timeout,
+    )
+    r.raise_for_status()
+    return _ad_raise_for_payload(r.json())
+
+
+def _ad_delete_magnet(magnet_id, api_token):
+    if not magnet_id:
+        return
+    try:
+        _ad_post("/magnet/delete", api_token, data={"id": str(magnet_id)}, timeout=5)
+    except Exception:
+        pass
 
 
 # ------------------------------------------------------------------ #
@@ -1162,6 +1243,72 @@ def _episode_file_sort_key(file_info, query_title, season, episode, year=None):
     year_score = _year_rank(path, year)
     size = _video_file_size(file_info)
     return title_rank + (episode_rank, season_rank, year_score, -size)
+
+
+def _flatten_ad_files(files, prefix=""):
+    flattened = []
+    for item in files or []:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("n") or item.get("name") or ""
+        path = f"{prefix}/{name}" if prefix and name else (name or prefix)
+        if item.get("e"):
+            flattened.extend(_flatten_ad_files(item.get("e") or [], path))
+            continue
+        link = item.get("l") or item.get("link") or ""
+        size = item.get("s") or item.get("size") or 0
+        if link:
+            flattened.append({
+                "path": path,
+                "filename": name,
+                "bytes": size,
+                "link": link,
+            })
+    return flattened
+
+
+def _pick_best_file(files, candidate, season, episode, query_title=None, year=None):
+    ep_markers = []
+    if season and episode:
+        ep_markers = [
+            f"s{int(season):02d}e{int(episode):02d}",
+            f"{season}x{int(episode):02d}",
+        ]
+
+    video_files = []
+    for f in files or []:
+        fname = _video_file_path(f).lower()
+        if not any(fname.endswith(e) for e in _VIDEO_EXTS):
+            continue
+        if _skip_advertised_av1_before_resolve(fname):
+            continue
+        video_files.append(f)
+
+    episode_files = []
+    if ep_markers:
+        episode_files = [
+            f for f in video_files
+            if any(marker in _video_file_path(f).lower() for marker in ep_markers)
+        ]
+
+    pool = episode_files or video_files
+    if not pool:
+        return None
+
+    if season and episode:
+        return min(
+            pool,
+            key=lambda f: (_av1_text_rank(_video_file_path(f)),)
+            + _episode_file_sort_key(f, query_title, season, episode, year),
+        )
+    return min(
+        pool,
+        key=lambda f: (
+            _av1_text_rank(_video_file_path(f)),
+            -_video_file_size(f),
+            _title_sequence_rank(_video_file_path(f), candidate.get("title", "")) or (9, 99),
+        ),
+    )
 
 
 def _try_resolve_one(candidate, api_token, season, episode, cancel_event,
@@ -1356,6 +1503,8 @@ def _try_resolve_one(candidate, api_token, season, episode, cancel_event,
                 "pack_rank": candidate.get("pack_rank"),
                 "av1_probe": "not_av1" if av1_probe is False else "unknown",
                 "url_refreshed_after_probe": url_refreshed,
+                "provider": _PROVIDER_RD,
+                "provider_label": _provider_label(_PROVIDER_RD),
             }
         _rd_delete(f"/torrents/delete/{rd_id}", api_token)
         rd_id = None
@@ -1378,12 +1527,132 @@ def _try_resolve_one(candidate, api_token, season, episode, cancel_event,
         return None
 
 
+def _try_resolve_one_ad(candidate, api_token, season, episode, cancel_event,
+                        query_title=None, year=None):
+    """
+    Try to resolve a single candidate hash via AllDebrid.
+    Returns a playable candidate dict on success, None on failure.
+    """
+    h8 = candidate['hash'][:8]
+    ad_id = None
+    try:
+        if _cancelled(cancel_event):
+            return None
+
+        magnet = f"magnet:?xt=urn:btih:{candidate['hash']}"
+        upload = _ad_post(
+            "/magnet/upload",
+            api_token,
+            data=[("magnets[]", magnet)],
+            timeout=10,
+        )
+        magnets = upload.get("magnets") or []
+        item = magnets[0] if magnets else {}
+        if item.get("error"):
+            _log(f"{h8} AD upload error: {item.get('error')}", xbmc.LOGWARNING)
+            return None
+        ad_id = item.get("id")
+        if not ad_id:
+            _log(f"{h8} AD upload returned no id")
+            return None
+        if not item.get("ready"):
+            _log(f"{h8} not instantly cached on AD")
+            _ad_delete_magnet(ad_id, api_token)
+            ad_id = None
+            return None
+
+        if _skip_advertised_av1_before_resolve(candidate.get("title")):
+            _log(f"{h8} skipped AV1 candidate on AD: {candidate.get('title')!r}", xbmc.LOGWARNING)
+            _ad_delete_magnet(ad_id, api_token)
+            ad_id = None
+            return None
+
+        if _cancelled(cancel_event):
+            _ad_delete_magnet(ad_id, api_token)
+            ad_id = None
+            return None
+
+        files_data = _ad_post(
+            "/magnet/files",
+            api_token,
+            data=[("id[]", str(ad_id))],
+            timeout=10,
+        )
+        magnet_files = files_data.get("magnets") or []
+        files_entry = magnet_files[0] if magnet_files else {}
+        files = _flatten_ad_files(files_entry.get("files") or [])
+        best_file = _pick_best_file(files, candidate, season, episode, query_title, year)
+        if not best_file:
+            _log(f"{h8} no non-AV1 video file in AD magnet")
+            _ad_delete_magnet(ad_id, api_token)
+            ad_id = None
+            return None
+
+        link_to_use = best_file.get("link")
+        unlocked = _ad_post("/link/unlock", api_token, data={"link": link_to_use}, timeout=10)
+        url = unlocked.get("link")
+        filename = unlocked.get("filename") or best_file.get("filename") or candidate.get("title", "Stream")
+
+        av1_probe = _probe_actual_av1_stream(url)
+        if av1_probe is True:
+            _log(f"{h8} resolved AD AV1 stream skipped by codec probe: {filename!r}", xbmc.LOGWARNING)
+            _ad_delete_magnet(ad_id, api_token)
+            ad_id = None
+            return None
+        if av1_probe is None and (is_av1_stream(filename) or is_av1_stream(url)):
+            _log(f"{h8} resolved AD AV1 stream skipped: {filename!r}", xbmc.LOGWARNING)
+            _ad_delete_magnet(ad_id, api_token)
+            ad_id = None
+            return None
+
+        if url:
+            url_refreshed = False
+            if _actual_av1_probe_enabled():
+                fresh = _ad_post("/link/unlock", api_token, data={"link": link_to_use}, timeout=10)
+                url = fresh.get("link") or url
+                filename = fresh.get("filename", filename)
+                url_refreshed = True
+            _ad_delete_magnet(ad_id, api_token)
+            ad_id = None
+            if av1_probe is False:
+                _log(f"{h8} AD codec probe verified non-AV1: {filename!r}")
+            else:
+                _log(f"{h8} AD codec probe inconclusive; allowing: {filename!r}")
+            return {
+                "url": url,
+                "headers": {},
+                "name": filename,
+                "hash": candidate.get("hash"),
+                "title": candidate.get("title", ""),
+                "pack_scope": candidate.get("pack_scope", ""),
+                "pack_rank": candidate.get("pack_rank"),
+                "av1_probe": "not_av1" if av1_probe is False else "unknown",
+                "url_refreshed_after_probe": url_refreshed,
+                "provider": _PROVIDER_AD,
+                "provider_label": _provider_label(_PROVIDER_AD),
+            }
+        _ad_delete_magnet(ad_id, api_token)
+        ad_id = None
+        return None
+
+    except PermissionError:
+        _log(f"{h8} AD auth rejected", xbmc.LOGWARNING)
+        if ad_id:
+            _ad_delete_magnet(ad_id, api_token)
+        return _AUTH_FAILURE
+    except Exception as exc:
+        _log(f"{h8} AD failed: {exc}", xbmc.LOGWARNING)
+        if ad_id:
+            _ad_delete_magnet(ad_id, api_token)
+        return None
+
+
 def _resolve_by_direct_add(candidates_info, api_token, season=None, episode=None,
                            max_resolve=1, cancel_event=None, query_title=None,
-                           year=None, blocked_hashes=None):
+                           year=None, blocked_hashes=None, provider=_PROVIDER_RD):
     """
-    Resolve streams by adding magnets to RD and checking for instant cache.
-    Runs candidates in small batches to avoid RD 429 rate-limits,
+    Resolve streams by adding magnets to a debrid provider and checking cache.
+    Runs candidates in small batches to avoid provider rate-limits,
     returns as soon as max_resolve streams are found.
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -1400,8 +1669,10 @@ def _resolve_by_direct_add(candidates_info, api_token, season=None, episode=None
 
     combined = _CombinedEvent()
 
-    batch_size = _RD_ADD_MAGNET_BATCH_SIZE
-    _log(f"Resolving {len(candidates_info)} candidates in batches of {batch_size} (need {max_resolve})")
+    batch_size = _RD_ADD_MAGNET_BATCH_SIZE if provider == _PROVIDER_RD else 3
+    short = _provider_short(provider)
+    resolver = _try_resolve_one_ad if provider == _PROVIDER_AD else _try_resolve_one
+    _log(f"Resolving {len(candidates_info)} candidates on {short} in batches of {batch_size} (need {max_resolve})")
 
     # RD often rate-limits addMagnet when probed in parallel, especially after
     # many 451 responses, so this intentionally defaults to serial probing.
@@ -1410,12 +1681,12 @@ def _resolve_by_direct_add(candidates_info, api_token, season=None, episode=None
             break
 
         batch = candidates_info[batch_start:batch_start + batch_size]
-        _log(f"Batch {batch_start // batch_size + 1}: candidates {batch_start + 1}-{batch_start + len(batch)}")
+        _log(f"{short} batch {batch_start // batch_size + 1}: candidates {batch_start + 1}-{batch_start + len(batch)}")
 
         pool = ThreadPoolExecutor(max_workers=batch_size)
         futures = {
             pool.submit(
-                _try_resolve_one, c, api_token, season, episode, combined,
+                resolver, c, api_token, season, episode, combined,
                 query_title, year
             ): c
             for c in batch
@@ -1423,7 +1694,7 @@ def _resolve_by_direct_add(candidates_info, api_token, season=None, episode=None
         try:
             for future in as_completed(futures):
                 result = future.result()
-                if result is _RD_AUTH_FAILURE:
+                if result is _AUTH_FAILURE:
                     # Count auth failures; if the whole first batch fails with 401
                     # the token is bad — abort immediately and signal re-auth needed.
                     pass  # counted below after batch drains
@@ -1454,9 +1725,9 @@ def _resolve_by_direct_add(candidates_info, api_token, season=None, episode=None
             except Exception:
                 pass
         non_none = [r for r in batch_results if r is not None]
-        if non_none and all(r is _RD_AUTH_FAILURE for r in non_none):
-            _log("All RD calls returned 401 – token is invalid, raising auth error", xbmc.LOGWARNING)
-            raise PermissionError("rd_token_rejected")
+        if non_none and all(r is _AUTH_FAILURE for r in non_none):
+            _log(f"All {short} calls returned auth failure – token is invalid", xbmc.LOGWARNING)
+            raise PermissionError(f"{provider}_token_rejected")
 
         if resolved:
             break
@@ -1464,9 +1735,9 @@ def _resolve_by_direct_add(candidates_info, api_token, season=None, episode=None
         if enough_event.is_set():
             break
 
-        # Stagger addMagnet calls to stay below RD's burst throttle.
+        # Stagger addMagnet calls to stay below provider burst throttles.
         if batch_start + batch_size < len(candidates_info):
-            _time.sleep(_RD_ADD_MAGNET_BATCH_PAUSE)
+            _time.sleep(_RD_ADD_MAGNET_BATCH_PAUSE if provider == _PROVIDER_RD else 0.2)
 
     return resolved
 
@@ -1574,20 +1845,21 @@ def fetch_all_cached_streams(catalog_type, video_id, cancel_event=None,
                              ignore_pack_binding=False):
     """
     Main entry point.  Queries DMM's hash database, then resolves cached
-    streams via RD direct-add.  Returns a sorted list of
+    streams via configured debrid providers.  Returns a sorted list of
     {"url", "headers", "name"} candidates.
 
     Note: RD's instantAvailability endpoint is permanently disabled
-    (error_code 37), so we skip it entirely and use the direct-add
-    approach: addMagnet → selectFiles → check status == 'downloaded'.
+    (error_code 37), so RD uses direct-add. AllDebrid also uses direct-add
+    because upload returns whether the magnet is ready.
 
     catalog_type: "movie" or "series"
     video_id:     "tt1234567" for movies, "tt1234567:1:2" for episodes
     """
-    api_token = _rd_key()
-    if not api_token:
-        _log("No RD access token — authorization required", xbmc.LOGWARNING)
-        raise PermissionError("no_rd_token")
+    debrid_accounts = _get_debrid_accounts()
+    if not debrid_accounts:
+        _log("No debrid access token — authorization required", xbmc.LOGWARNING)
+        raise PermissionError("no_debrid_token")
+    api_token = debrid_accounts[0]["token"]
 
     # Parse video_id: for series it's "imdb:season:episode"
     parts = video_id.split(":")
@@ -1627,27 +1899,33 @@ def fetch_all_cached_streams(catalog_type, video_id, cancel_event=None,
                 "pack_rank": 1,
             }
             if len(bound_candidate["hash"]) == 40:
-                if blocked_cache and blocked_cache.is_blocked(bound_candidate["hash"]):
-                    _log(f"Bound pack is RD-451 blocked; clearing binding for {imdb_id} S{int(season):02d}",
-                         xbmc.LOGWARNING)
-                    pack_cache.clear(imdb_id, season)
-                    binding = None
-                else:
+                for account in debrid_accounts:
+                    provider = account["provider"]
+                    if provider == _PROVIDER_RD and blocked_cache and blocked_cache.is_blocked(bound_candidate["hash"]):
+                        _log(f"Bound pack is RD-451 blocked; skipping RD for {imdb_id} S{int(season):02d}",
+                             xbmc.LOGWARNING)
+                        continue
                     blocked_hashes = []
-                    _log(f"Trying bound pack for {imdb_id} S{int(season):02d}: "
+                    _log(f"Trying bound pack on {_provider_short(provider)} for {imdb_id} S{int(season):02d}: "
                          f"{bound_candidate['hash'][:8]} {bound_candidate['title']!r}")
-                    resolved = _resolve_by_direct_add(
-                        [bound_candidate], api_token, season=season, episode=episode,
-                        max_resolve=1, cancel_event=cancel_event,
-                        query_title=query_title, year=year, blocked_hashes=blocked_hashes,
-                    )
+                    try:
+                        resolved = _resolve_by_direct_add(
+                            [bound_candidate], account["token"], season=season, episode=episode,
+                            max_resolve=1, cancel_event=cancel_event,
+                            query_title=query_title, year=year, blocked_hashes=blocked_hashes,
+                            provider=provider,
+                        )
+                    except PermissionError as exc:
+                        _log(f"{_provider_short(provider)} auth failed while trying bound pack: {exc}",
+                             xbmc.LOGWARNING)
+                        continue
                     if blocked_cache and blocked_hashes:
                         blocked_cache.mark_many(blocked_hashes)
                     if resolved:
                         return resolved
-                    _log(f"Bound pack failed for {imdb_id} S{int(season):02d}; clearing binding",
-                         xbmc.LOGWARNING)
-                    pack_cache.clear(imdb_id, season)
+                _log(f"Bound pack failed for {imdb_id} S{int(season):02d}; clearing binding",
+                     xbmc.LOGWARNING)
+                pack_cache.clear(imdb_id, season)
 
     # 1. Get all hashes from DMM
     try:
@@ -1732,13 +2010,9 @@ def fetch_all_cached_streams(catalog_type, video_id, cancel_event=None,
 
     primary_candidates = []
     fallback_candidates = []
-    skipped_blocked = 0
     for r in sorted_dmm:
         h = (r.get("hash") or "").lower()
         if len(h) != 40:
-            continue
-        if blocked_cache and blocked_cache.is_blocked(h):
-            skipped_blocked += 1
             continue
         candidate = {"hash": h, "title": r.get("title", "Unknown")}
         if catalog_type != "movie":
@@ -1750,9 +2024,6 @@ def fetch_all_cached_streams(catalog_type, video_id, cancel_event=None,
         else:
             primary_candidates.append(candidate)
 
-    if skipped_blocked:
-        _log(f"Skipped {skipped_blocked} previously RD-451-blocked hash(es)")
-
     candidates = primary_candidates + fallback_candidates
     if fallback_candidates:
         _log(
@@ -1760,36 +2031,64 @@ def fetch_all_cached_streams(catalog_type, video_id, cancel_event=None,
             "until non-advertised candidates are exhausted"
         )
 
-    _log(f"DMM returned {len(hash_map)} hashes, checking {len(candidates)} unblocked candidate(s) on RD")
+    provider_names = ", ".join(_provider_short(a["provider"]) for a in debrid_accounts)
+    _log(f"DMM returned {len(hash_map)} hashes, checking {len(candidates)} candidate(s) on {provider_names}")
 
     resolved = []
     page_size = 20
+    auth_failed_providers = set()
     for page_start in range(0, len(candidates), page_size):
         if _cancelled(cancel_event):
             break
 
         page = candidates[page_start:page_start + page_size]
-        _log(f"RD search page {page_start // page_size + 1}: "
+        _log(f"Debrid search page {page_start // page_size + 1}: "
              f"candidates {page_start + 1}-{page_start + len(page)}")
-        blocked_hashes = []
-        resolved = _resolve_by_direct_add(
-            page, api_token, season=season, episode=episode,
-            max_resolve=3, cancel_event=cancel_event,
-            query_title=query_title, year=year,
-            blocked_hashes=blocked_hashes,
-        )
-        if blocked_cache and blocked_hashes:
-            blocked_cache.mark_many(blocked_hashes)
-            _log(f"Marked {len(blocked_hashes)} RD-451-blocked hash(es)")
+        for account in debrid_accounts:
+            provider = account["provider"]
+            provider_page = page
+            if provider == _PROVIDER_RD and blocked_cache:
+                before = len(provider_page)
+                provider_page = [
+                    c for c in provider_page
+                    if not blocked_cache.is_blocked(c.get("hash"))
+                ]
+                skipped = before - len(provider_page)
+                if skipped:
+                    _log(f"Skipped {skipped} previously RD-451-blocked hash(es)")
+            if not provider_page:
+                continue
+            blocked_hashes = []
+            try:
+                resolved = _resolve_by_direct_add(
+                    provider_page, account["token"], season=season, episode=episode,
+                    max_resolve=3, cancel_event=cancel_event,
+                    query_title=query_title, year=year,
+                    blocked_hashes=blocked_hashes,
+                    provider=provider,
+                )
+            except PermissionError as exc:
+                _log(f"{_provider_short(provider)} auth failed; trying next provider: {exc}",
+                     xbmc.LOGWARNING)
+                auth_failed_providers.add(provider)
+                continue
+            if blocked_cache and blocked_hashes:
+                blocked_cache.mark_many(blocked_hashes)
+                _log(f"Marked {len(blocked_hashes)} RD-451-blocked hash(es)")
+            if resolved:
+                break
         if resolved:
             break
+        if len(auth_failed_providers) == len(debrid_accounts):
+            raise PermissionError("all_debrid_tokens_rejected")
 
     if not resolved:
         xbmcgui.Dialog().notification(
-            "KDMM", "No cached streams found for this title on RD",
+            "KDMM", "No cached streams found for this title on configured debrid accounts",
             xbmcgui.NOTIFICATION_WARNING, 6000)
     else:
-        _log(f"Resolved {len(resolved)} stream(s), top: {resolved[0]['name']!r}")
+        _log(f"Resolved {len(resolved)} stream(s), top: {resolved[0]['name']!r} "
+             f"via {resolved[0].get('provider_label', 'debrid')}")
         top = resolved[0]
         if pack_cache and top.get("pack_rank") in (0, 1):
             pack_cache.set(
