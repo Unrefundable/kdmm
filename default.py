@@ -175,6 +175,12 @@ def _candidate_has_probe_consumed_url(candidate):
     )
 
 
+def _candidate_needs_accessibility_check(candidate):
+    # The AV1 probe already touched the first debrid URL. When the resolver
+    # refreshed it afterward, leave that fresh URL untouched for Kodi.
+    return not bool(candidate.get("url_refreshed_after_probe"))
+
+
 def _cache_needs_refresh(cached):
     candidates = cached if isinstance(cached, list) else [cached]
     return any(_candidate_has_probe_consumed_url(c) for c in candidates if isinstance(c, dict))
@@ -374,7 +380,8 @@ def action_play(params):
     # ---- 4. Store full candidate list for service.py retry ----------- #
     chosen_idx = 0
     for i, c in enumerate(candidates):
-        if is_stream_accessible(c["url"], c.get("headers") or {}):
+        if (not _candidate_needs_accessibility_check(c)
+                or is_stream_accessible(c["url"], c.get("headers") or {})):
             if i > 0:
                 _log(f"Skipped {i} inaccessible candidate(s); using: {c['name']!r}")
             chosen_idx = i
