@@ -151,6 +151,12 @@ def _should_show_segment_button(processed_segments, segment_key, current_time,
     return True
 
 
+def _candidate_needs_accessibility_check(candidate):
+    # Refreshed debrid URLs are intentionally untouched after the codec probe;
+    # probing them again can make Kodi fail when it opens the stream.
+    return not bool(candidate.get("url_refreshed_after_probe"))
+
+
 class SegmentController:
     def __init__(self):
         self.reset()
@@ -521,7 +527,8 @@ class BridgePlayer(xbmc.Player):
             url = c.get("url", "").split("|")[0]
             if url in self._tried_urls:
                 continue
-            if not is_stream_accessible(url, c.get("headers") or {}):
+            if (_candidate_needs_accessibility_check(c)
+                    and not is_stream_accessible(url, c.get("headers") or {})):
                 _log(f"Candidate {c.get('name', '?')!r} too small – skipping", xbmc.LOGWARNING)
                 self._tried_urls.add(url)
                 continue
