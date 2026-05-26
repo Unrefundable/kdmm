@@ -27,7 +27,7 @@ streams.
 Install the Kodi repository zip from:
 
 ```text
-https://unrefundable.github.io/kdmm/repository.unrefundable.kdmm-1.0.0.zip
+https://unrefundable.github.io/kdmm
 ```
 
 After installing the repository, install or update the KDMM add-on from Kodi's
