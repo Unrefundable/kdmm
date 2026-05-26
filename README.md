@@ -44,4 +44,4 @@ add-on browser.
 
 ## Current Release
 
-The current published add-on version is `2.6.16`.
+The current published add-on version is `2.6.17`.

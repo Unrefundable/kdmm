@@ -1612,8 +1612,9 @@ def _try_resolve_one_ad(candidate, api_token, season, episode, cancel_event,
                 url = fresh.get("link") or url
                 filename = fresh.get("filename", filename)
                 url_refreshed = True
-            _ad_delete_magnet(ad_id, api_token)
-            ad_id = None
+            # Keep the AllDebrid magnet while Kodi opens the unlocked CDN URL.
+            # Deleting it here can invalidate the freshly unlocked link before
+            # VideoPlayer starts, producing an immediate OpenInputStream error.
             if av1_probe is False:
                 _log(f"{h8} AD codec probe verified non-AV1: {filename!r}")
             else:
