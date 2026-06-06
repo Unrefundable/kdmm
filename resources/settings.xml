@@ -20,7 +20,7 @@
         <setting id="resolution_priority" type="enum" label="Resolution preference" values="4K (2160p)|1080p|720p" default="0"/>
         <setting id="source_priority" type="enum" label="Source preference" values="Remux|BluRay encode|WEB|Any" default="0"/>
         <setting id="probe_av1_codec" type="bool" label="Probe resolved file metadata for AV1" default="true"/>
-        <setting id="preferred_audio_language" type="text" label="Preferred audio language (blank = any)" default=""/>
+        <setting id="preferred_audio_language" type="enum" label="Preferred audio language" values="Any|English|Japanese|Korean|Spanish|French|German|Italian|Portuguese|Chinese|Hindi|Arabic|Russian|Dutch|Polish|Swedish|Danish|Norwegian|Finnish|Turkish" default="0"/>
         <setting id="strict_title_matching" type="bool" label="Strict title matching (prefer no play over wrong title)" default="false"/>
         <setting id="tv_pack_preference" type="enum" label="TV pack preference" values="Prefer complete packs|Balanced|Allow singles" default="0"/>
     </category>
