@@ -77,6 +77,32 @@ _AUDIO_LANG_ALIASES = {
     "fi": "fi", "fin": "fi", "finnish": "fi",
     "tr": "tr", "tur": "tr", "turkish": "tr",
 }
+_AUDIO_LANGUAGE_CHOICES = (
+    "", "en", "ja", "ko", "es", "fr", "de", "it", "pt", "zh",
+    "hi", "ar", "ru", "nl", "pl", "sv", "da", "no", "fi", "tr",
+)
+_AUDIO_LANGUAGE_LABELS = {
+    "any": "",
+    "english": "en",
+    "japanese": "ja",
+    "korean": "ko",
+    "spanish": "es",
+    "french": "fr",
+    "german": "de",
+    "italian": "it",
+    "portuguese": "pt",
+    "chinese": "zh",
+    "hindi": "hi",
+    "arabic": "ar",
+    "russian": "ru",
+    "dutch": "nl",
+    "polish": "pl",
+    "swedish": "sv",
+    "danish": "da",
+    "norwegian": "no",
+    "finnish": "fi",
+    "turkish": "tr",
+}
 _ENGLISH_DEFAULT_AUDIO_LABELS = {"default", "standard"}
 _RD_ADD_MAGNET_BATCH_SIZE = 3
 _RD_ADD_MAGNET_BATCH_PAUSE = 0.35
@@ -340,7 +366,15 @@ def _canonical_audio_language(value):
 
 
 def _preferred_audio_language():
-    return _canonical_audio_language(_setting_text("preferred_audio_language", ""))
+    raw = _setting_text("preferred_audio_language", "").strip()
+    if raw.isdigit():
+        idx = int(raw)
+        if 0 <= idx < len(_AUDIO_LANGUAGE_CHOICES):
+            return _AUDIO_LANGUAGE_CHOICES[idx]
+    normalized = _normalize_text(raw).strip()
+    if normalized in _AUDIO_LANGUAGE_LABELS:
+        return _AUDIO_LANGUAGE_LABELS[normalized]
+    return _canonical_audio_language(raw)
 
 
 def _audio_track_matches_preference(track, preferred):
