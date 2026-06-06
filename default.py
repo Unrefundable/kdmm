@@ -49,7 +49,12 @@ NO_RESUME = len(sys.argv) > 3 and "resume:false" in sys.argv[3].lower()
 sys.path.insert(0, os.path.join(_ADDON_PATH, "lib"))
 
 from cache import StreamCache, ProgressCache, PackBindingCache        # noqa: E402 (after sys.path)
-from dmm import fetch_all_cached_streams, is_av1_stream, is_stream_accessible    # noqa: E402
+from dmm import (    # noqa: E402
+    candidate_matches_audio_preference,
+    fetch_all_cached_streams,
+    is_av1_stream,
+    is_stream_accessible,
+)
 from playback import apply_playback_metadata, build_playback_context, encode_playback_context  # noqa: E402
 from ad_auth import authorize as ad_authorize, revoke as ad_revoke  # noqa: E402
 from rd_auth import authorize as rd_authorize, revoke as rd_revoke  # noqa: E402
@@ -161,10 +166,22 @@ def _play_stream(media_id, url, headers_dict, imdb, tmdb, title, showtitle,
 def _filter_playable_candidates(candidates):
     if isinstance(candidates, dict):
         candidates = [candidates]
-    filtered = [candidate for candidate in (candidates or []) if not is_av1_stream(candidate)]
-    removed = len(candidates or []) - len(filtered)
-    if removed:
-        _log(f"Filtered {removed} cached/resolved AV1 candidate(s)", xbmc.LOGWARNING)
+    original = list(candidates or [])
+    filtered = [
+        candidate for candidate in original
+        if not is_av1_stream(candidate)
+        and candidate_matches_audio_preference(candidate)
+    ]
+    av1_removed = sum(1 for candidate in original if is_av1_stream(candidate))
+    audio_removed = len(original) - av1_removed - len(filtered)
+    if av1_removed:
+        _log(f"Filtered {av1_removed} cached/resolved AV1 candidate(s)", xbmc.LOGWARNING)
+    if audio_removed:
+        _log(
+            f"Filtered {audio_removed} cached/resolved candidate(s) missing "
+            "the current audio language probe",
+            xbmc.LOGWARNING,
+        )
     return filtered
 
 

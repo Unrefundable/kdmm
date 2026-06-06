@@ -51,6 +51,33 @@ _NON_AV1_CODEC_MARKERS = (
     b"vp09", b"vp08", b"v_mpeg4/iso/avc", b"v_mpegh/iso/hevc",
     b"v_mpeg4/iso/asp", b"v_mpeg2", b"v_vp8", b"v_vp9",
 )
+_AUDIO_PROBE_BYTES = 4 * 1024 * 1024
+_AUDIO_LANG_ALIASES = {
+    "en": "en", "eng": "en", "english": "en",
+    "ja": "ja", "jpn": "ja", "jap": "ja", "japanese": "ja",
+    "ko": "ko", "kor": "ko", "korean": "ko",
+    "es": "es", "spa": "es", "esp": "es", "esl": "es", "spanish": "es",
+    "castellano": "es", "castilian": "es",
+    "fr": "fr", "fre": "fr", "fra": "fr", "french": "fr",
+    "de": "de", "ger": "de", "deu": "de", "german": "de",
+    "it": "it", "ita": "it", "italian": "it",
+    "pt": "pt", "por": "pt", "portuguese": "pt", "br": "pt", "brazilian": "pt",
+    "ru": "ru", "rus": "ru", "russian": "ru",
+    "zh": "zh", "chi": "zh", "zho": "zh", "cmn": "zh", "mandarin": "zh",
+    "yue": "zh", "cantonese": "zh", "chinese": "zh",
+    "hi": "hi", "hin": "hi", "hindi": "hi",
+    "ta": "ta", "tam": "ta", "tamil": "ta",
+    "te": "te", "tel": "te", "telugu": "te",
+    "ar": "ar", "ara": "ar", "arabic": "ar",
+    "nl": "nl", "dut": "nl", "nld": "nl", "dutch": "nl",
+    "pl": "pl", "pol": "pl", "polish": "pl",
+    "sv": "sv", "swe": "sv", "swedish": "sv",
+    "da": "da", "dan": "da", "danish": "da",
+    "no": "no", "nor": "no", "norwegian": "no",
+    "fi": "fi", "fin": "fi", "finnish": "fi",
+    "tr": "tr", "tur": "tr", "turkish": "tr",
+}
+_ENGLISH_DEFAULT_AUDIO_LABELS = {"default", "standard"}
 _RD_ADD_MAGNET_BATCH_SIZE = 3
 _RD_ADD_MAGNET_BATCH_PAUSE = 0.35
 _RD_ADD_MAGNET_429_BACKOFFS = (1.5, 3.0, 6.0)
@@ -290,6 +317,342 @@ def _probe_actual_av1_stream(url, headers=None):
             return result
 
     return None
+
+
+def _setting_text(key, default=""):
+    try:
+        value = xbmcaddon.Addon().getSetting(key)
+    except Exception:
+        value = default
+    return default if value is None else str(value)
+
+
+def _canonical_audio_language(value):
+    text = _normalize_text(value).strip()
+    if not text:
+        return ""
+    if text in _AUDIO_LANG_ALIASES:
+        return _AUDIO_LANG_ALIASES[text]
+    for token in _tokenize_text(text):
+        if token in _AUDIO_LANG_ALIASES:
+            return _AUDIO_LANG_ALIASES[token]
+    return text
+
+
+def _preferred_audio_language():
+    return _canonical_audio_language(_setting_text("preferred_audio_language", ""))
+
+
+def _audio_track_matches_preference(track, preferred):
+    if not preferred:
+        return True
+    values = [
+        track.get("language", ""),
+        track.get("language_ietf", ""),
+        track.get("name", ""),
+    ]
+    for value in values:
+        if _canonical_audio_language(value) == preferred:
+            return True
+
+    if preferred == "en":
+        for value in values:
+            tokens = set(_tokenize_text(value))
+            if tokens & _ENGLISH_DEFAULT_AUDIO_LABELS:
+                return True
+    return False
+
+
+def _read_ebml_id(data, pos):
+    if pos >= len(data):
+        return None, pos
+    first = data[pos]
+    mask = 0x80
+    length = 1
+    while length <= 4 and not (first & mask):
+        mask >>= 1
+        length += 1
+    if length > 4 or pos + length > len(data):
+        return None, pos
+    return int.from_bytes(data[pos:pos + length], "big"), pos + length
+
+
+def _read_ebml_size(data, pos):
+    if pos >= len(data):
+        return None, pos
+    first = data[pos]
+    mask = 0x80
+    length = 1
+    while length <= 8 and not (first & mask):
+        mask >>= 1
+        length += 1
+    if length > 8 or pos + length > len(data):
+        return None, pos
+    value = first & (mask - 1)
+    for byte in data[pos + 1:pos + length]:
+        value = (value << 8) | byte
+    max_value = (1 << (7 * length)) - 1
+    if value == max_value:
+        value = len(data) - (pos + length)
+    return value, pos + length
+
+
+def _iter_ebml_children(data, start, end):
+    pos = start
+    end = min(end, len(data))
+    while pos < end:
+        element_id, payload_start = _read_ebml_id(data, pos)
+        if element_id is None or payload_start <= pos:
+            break
+        size, payload_start = _read_ebml_size(data, payload_start)
+        if size is None:
+            break
+        payload_end = payload_start + size
+        if payload_end > len(data):
+            break
+        yield element_id, payload_start, payload_end
+        pos = payload_end
+
+
+def _decode_ebml_uint(value):
+    if not value:
+        return 0
+    return int.from_bytes(value, "big")
+
+
+def _decode_ebml_text(value):
+    for encoding in ("utf-8", "latin-1"):
+        try:
+            return value.decode(encoding, "ignore").strip("\x00 ")
+        except Exception:
+            continue
+    return ""
+
+
+def _parse_mkv_track_entry(data, start, end):
+    track = {
+        "container": "mkv",
+        "language": "",
+        "language_ietf": "",
+        "name": "",
+        "default": False,
+        "type": 0,
+    }
+    for element_id, payload_start, payload_end in _iter_ebml_children(data, start, end):
+        value = data[payload_start:payload_end]
+        if element_id == 0x83:  # TrackType
+            track["type"] = _decode_ebml_uint(value)
+        elif element_id == 0x22B59C:  # Language
+            track["language"] = _decode_ebml_text(value)
+        elif element_id == 0x22B59D:  # LanguageIETF
+            track["language_ietf"] = _decode_ebml_text(value)
+        elif element_id == 0x536E:  # Name
+            track["name"] = _decode_ebml_text(value)
+        elif element_id == 0x88:  # FlagDefault
+            track["default"] = bool(_decode_ebml_uint(value))
+    return track if track.get("type") == 2 else None
+
+
+def _parse_mkv_audio_tracks(data):
+    tracks = []
+    search_from = 0
+    tracks_id = b"\x16\x54\xAE\x6B"
+    while True:
+        idx = data.find(tracks_id, search_from)
+        if idx < 0:
+            break
+        element_id, payload_start = _read_ebml_id(data, idx)
+        if element_id != 0x1654AE6B:
+            search_from = idx + 1
+            continue
+        size, payload_start = _read_ebml_size(data, payload_start)
+        if size is None:
+            break
+        payload_end = min(payload_start + size, len(data))
+        for child_id, child_start, child_end in _iter_ebml_children(data, payload_start, payload_end):
+            if child_id == 0xAE:
+                track = _parse_mkv_track_entry(data, child_start, child_end)
+                if track:
+                    tracks.append(track)
+        search_from = max(idx + 1, payload_end)
+    return tracks
+
+
+def _iter_mp4_atoms(data, start=0, end=None):
+    end = len(data) if end is None else min(end, len(data))
+    pos = start
+    while pos + 8 <= end:
+        size = int.from_bytes(data[pos:pos + 4], "big")
+        atom_type = data[pos + 4:pos + 8]
+        header_size = 8
+        if size == 1:
+            if pos + 16 > end:
+                break
+            size = int.from_bytes(data[pos + 8:pos + 16], "big")
+            header_size = 16
+        elif size == 0:
+            size = end - pos
+        if size < header_size or pos + size > end:
+            break
+        if not all(32 <= byte <= 126 for byte in atom_type):
+            break
+        yield atom_type, pos + header_size, pos + size
+        pos += size
+
+
+def _find_mp4_child(data, start, end, wanted):
+    for atom_type, payload_start, payload_end in _iter_mp4_atoms(data, start, end):
+        if atom_type == wanted:
+            return payload_start, payload_end
+    return None, None
+
+
+def _decode_mp4_language(packed):
+    chars = []
+    for shift in (10, 5, 0):
+        value = ((packed >> shift) & 0x1F) + 0x60
+        if value < 0x61 or value > 0x7A:
+            return ""
+        chars.append(chr(value))
+    lang = "".join(chars)
+    return "" if lang == "und" else lang
+
+
+def _parse_mp4_track(data, start, end):
+    mdia_start, mdia_end = _find_mp4_child(data, start, end, b"mdia")
+    if mdia_start is None:
+        return None
+
+    handler = ""
+    language = ""
+    name = ""
+    for atom_type, payload_start, payload_end in _iter_mp4_atoms(data, mdia_start, mdia_end):
+        value = data[payload_start:payload_end]
+        if atom_type == b"hdlr" and len(value) >= 24:
+            handler = value[8:12].decode("latin-1", "ignore")
+            name = value[24:].decode("utf-8", "ignore").strip("\x00 ")
+        elif atom_type == b"mdhd" and len(value) >= 24:
+            version = value[0]
+            lang_offset = 32 if version == 1 else 20
+            if len(value) >= lang_offset + 2:
+                language = _decode_mp4_language(
+                    int.from_bytes(value[lang_offset:lang_offset + 2], "big")
+                )
+    if handler != "soun":
+        return None
+    return {
+        "container": "mp4",
+        "language": language,
+        "language_ietf": "",
+        "name": name,
+        "default": False,
+    }
+
+
+def _parse_mp4_audio_tracks(data):
+    tracks = []
+    starts = [0]
+    search_from = 0
+    while True:
+        idx = data.find(b"moov", search_from)
+        if idx < 4:
+            break
+        atom_start = idx - 4
+        if atom_start not in starts:
+            starts.append(atom_start)
+        search_from = idx + 4
+
+    for start in starts:
+        for atom_type, payload_start, payload_end in _iter_mp4_atoms(data, start, len(data)):
+            if atom_type != b"moov":
+                continue
+            for child_type, child_start, child_end in _iter_mp4_atoms(data, payload_start, payload_end):
+                if child_type == b"trak":
+                    track = _parse_mp4_track(data, child_start, child_end)
+                    if track:
+                        tracks.append(track)
+    return tracks
+
+
+def _dedupe_audio_tracks(tracks):
+    deduped = []
+    seen = set()
+    for track in tracks:
+        key = (
+            _canonical_audio_language(track.get("language", "")),
+            _canonical_audio_language(track.get("language_ietf", "")),
+            _normalize_text(track.get("name", "")),
+            track.get("container", ""),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(track)
+    return deduped
+
+
+def _format_audio_tracks(tracks):
+    labels = []
+    for track in tracks:
+        parts = []
+        for key in ("language_ietf", "language", "name"):
+            value = track.get(key)
+            if value and value not in parts:
+                parts.append(value)
+        labels.append("/".join(parts) if parts else "unknown")
+    return ", ".join(labels)
+
+
+def _probe_audio_language_stream(url, headers=None, preferred=None):
+    """
+    Return True when the preferred language is present, False when audio
+    tracks were read and none matched, and None when metadata is inconclusive.
+    """
+    preferred = preferred or _preferred_audio_language()
+    if not preferred:
+        return True
+
+    samples = []
+    start_sample = _read_url_sample(url, headers, size=_AUDIO_PROBE_BYTES)
+    if start_sample:
+        samples.append(start_sample)
+
+    length = _remote_content_length(url, headers)
+    if length > _AUDIO_PROBE_BYTES:
+        end_sample = _read_url_sample(
+            url, headers, start=max(0, length - _AUDIO_PROBE_BYTES),
+            size=_AUDIO_PROBE_BYTES,
+        )
+        if end_sample:
+            samples.append(end_sample)
+
+    tracks = []
+    for sample in samples:
+        tracks.extend(_parse_mkv_audio_tracks(sample))
+        tracks.extend(_parse_mp4_audio_tracks(sample))
+
+    tracks = _dedupe_audio_tracks(tracks)
+    if not tracks:
+        return None
+    if any(_audio_track_matches_preference(track, preferred) for track in tracks):
+        _log(f"Audio language probe matched {preferred}: {_format_audio_tracks(tracks)}")
+        return True
+    _log(
+        f"Audio language probe found no {preferred} track: {_format_audio_tracks(tracks)}",
+        xbmc.LOGWARNING,
+    )
+    return False
+
+
+def candidate_matches_audio_preference(candidate):
+    preferred = _preferred_audio_language()
+    if not preferred:
+        return True
+    if not isinstance(candidate, dict):
+        return False
+    if candidate.get("audio_language_preference") != preferred:
+        return False
+    return candidate.get("audio_language_probe") in ("matched", "unknown")
 
 
 def _normalize_text(text):
@@ -1478,9 +1841,21 @@ def _try_resolve_one(candidate, api_token, season, episode, cancel_event,
             rd_id = None
             return None
 
+        audio_preference = _preferred_audio_language()
+        audio_probe = _probe_audio_language_stream(url, preferred=audio_preference)
+        if audio_probe is False:
+            _log(
+                f"{h8} resolved stream skipped; no preferred audio language "
+                f"{audio_preference!r}: {filename!r}",
+                xbmc.LOGWARNING,
+            )
+            _rd_delete(f"/torrents/delete/{rd_id}", api_token)
+            rd_id = None
+            return None
+
         if url:
             url_refreshed = False
-            if _actual_av1_probe_enabled():
+            if _actual_av1_probe_enabled() or bool(audio_preference):
                 # Some RD direct URLs do not survive a metadata range probe.
                 # Get a fresh playback URL after probing so Kodi opens cleanly.
                 fresh = _rd_post("/unrestrict/link", api_token, data={"link": link_to_use})
@@ -1502,6 +1877,8 @@ def _try_resolve_one(candidate, api_token, season, episode, cancel_event,
                 "pack_scope": candidate.get("pack_scope", ""),
                 "pack_rank": candidate.get("pack_rank"),
                 "av1_probe": "not_av1" if av1_probe is False else "unknown",
+                "audio_language_preference": audio_preference,
+                "audio_language_probe": "matched" if audio_probe is True else "unknown",
                 "url_refreshed_after_probe": url_refreshed,
                 "provider": _PROVIDER_RD,
                 "provider_label": _provider_label(_PROVIDER_RD),
@@ -1605,9 +1982,21 @@ def _try_resolve_one_ad(candidate, api_token, season, episode, cancel_event,
             ad_id = None
             return None
 
+        audio_preference = _preferred_audio_language()
+        audio_probe = _probe_audio_language_stream(url, preferred=audio_preference)
+        if audio_probe is False:
+            _log(
+                f"{h8} resolved AD stream skipped; no preferred audio language "
+                f"{audio_preference!r}: {filename!r}",
+                xbmc.LOGWARNING,
+            )
+            _ad_delete_magnet(ad_id, api_token)
+            ad_id = None
+            return None
+
         if url:
             url_refreshed = False
-            if _actual_av1_probe_enabled():
+            if _actual_av1_probe_enabled() or bool(audio_preference):
                 fresh = _ad_post("/link/unlock", api_token, data={"link": link_to_use}, timeout=10)
                 url = fresh.get("link") or url
                 filename = fresh.get("filename", filename)
@@ -1628,6 +2017,8 @@ def _try_resolve_one_ad(candidate, api_token, season, episode, cancel_event,
                 "pack_scope": candidate.get("pack_scope", ""),
                 "pack_rank": candidate.get("pack_rank"),
                 "av1_probe": "not_av1" if av1_probe is False else "unknown",
+                "audio_language_preference": audio_preference,
+                "audio_language_probe": "matched" if audio_probe is True else "unknown",
                 "url_refreshed_after_probe": url_refreshed,
                 "provider": _PROVIDER_AD,
                 "provider_label": _provider_label(_PROVIDER_AD),

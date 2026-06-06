@@ -1,6 +1,6 @@
 <?xml version='1.0' encoding='utf-8'?>
 <addons>
-    <addon id="plugin.video.kdmm" version="2.6.17" name="KDMM" provider-name="Unrefundable">
+    <addon id="plugin.video.kdmm" version="2.6.18" name="KDMM" provider-name="Unrefundable">
     <requires>
         <import addon="xbmc.python" version="3.0.0" />
         <import addon="script.module.requests" version="2.9.1" />
@@ -16,9 +16,9 @@
             Receives movie and episode play requests from TMDb Bingie Helper,
             queries Debrid Media Manager, resolves cached Real-Debrid and/or
             AllDebrid streams, and passes direct playback URLs to Kodi. Includes
-            quality sorting, AV1 filtering/probing, stream retry, stream and TV
-            pack caching, local resume progress, IntroDB-backed skip buttons,
-            and next-episode overlays.
+            quality sorting, AV1 and preferred-audio probing, stream retry,
+            stream and TV pack caching, local resume progress, IntroDB-backed
+            skip buttons, and next-episode overlays.
         </description>
         <platform>all</platform>
     </extension>
