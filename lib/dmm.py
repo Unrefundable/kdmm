@@ -864,26 +864,28 @@ def _episode_match_rank(title, season, episode):
     text = _normalize_text(title)
     season_num = int(season)
     episode_num = int(episode)
+
+    season_episode_hits = set()
+    for value_season, value_episode in re.findall(r"\bs0*(\d{1,2})[ ._-]*e0*(\d{1,3})\b", text):
+        season_episode_hits.add((int(value_season), int(value_episode)))
+    for value_season, value_episode in re.findall(r"\b(\d{1,2})x(\d{1,3})\b", text):
+        season_episode_hits.add((int(value_season), int(value_episode)))
+    for value_season, value_episode in re.findall(r"\bs0*(\d{1,2})[ ._-]+0*(\d{1,3})\b", text):
+        season_episode_hits.add((int(value_season), int(value_episode)))
+
+    if (season_num, episode_num) in season_episode_hits:
+        return 0
+    if season_episode_hits:
+        return 2
+
     exact_patterns = [
-        rf"\bs0*{season_num}[ ._-]*e0*{episode_num}\b",
-        rf"\b{season_num}x0*{episode_num}\b",
+        rf"\bseason[ ._-]*0*{season_num}[ ._-]*episode[ ._-]*0*{episode_num}\b",
         rf"\bepisode[ ._-]*0*{episode_num}\b",
         rf"\bep[ ._-]*0*{episode_num}\b",
         rf"\be0*{episode_num}\b",
     ]
     if any(re.search(pattern, text) for pattern in exact_patterns):
         return 0
-
-    season_episode_hits = set()
-    for value_season, value_episode in re.findall(r"\bs0*(\d{1,2})[ ._-]*e0*(\d{1,3})\b", text):
-        if int(value_season) == season_num:
-            season_episode_hits.add(int(value_episode))
-    for value_season, value_episode in re.findall(r"\b(\d{1,2})x(\d{1,3})\b", text):
-        if int(value_season) == season_num:
-            season_episode_hits.add(int(value_episode))
-
-    if season_episode_hits and episode_num not in season_episode_hits:
-        return 2
     return 1
 
 
@@ -919,7 +921,23 @@ def _extract_episode_keys(text):
         keys.add((int(season), int(episode)))
     for season, episode in re.findall(r"\b(\d{1,2})x0*(\d{1,3})\b", text):
         keys.add((int(season), int(episode)))
+    for season, episode in re.findall(r"\bs0*(\d{1,2})[ ._-]+0*(\d{1,3})\b", text):
+        keys.add((int(season), int(episode)))
     return keys
+
+
+def _episode_file_matches(file_info, season, episode):
+    if not season or not episode:
+        return True
+    path = _video_file_path(file_info)
+    return (
+        _episode_match_rank(path, season, episode) == 0
+        and _season_match_rank(path, season) < 2
+    )
+
+
+def _episode_label(season, episode):
+    return f"S{int(season):02d}E{int(episode):02d}"
 
 
 def _video_file_path(file_info):
@@ -1665,13 +1683,6 @@ def _flatten_ad_files(files, prefix=""):
 
 
 def _pick_best_file(files, candidate, season, episode, query_title=None, year=None):
-    ep_markers = []
-    if season and episode:
-        ep_markers = [
-            f"s{int(season):02d}e{int(episode):02d}",
-            f"{season}x{int(episode):02d}",
-        ]
-
     video_files = []
     for f in files or []:
         fname = _video_file_path(f).lower()
@@ -1682,11 +1693,13 @@ def _pick_best_file(files, candidate, season, episode, query_title=None, year=No
         video_files.append(f)
 
     episode_files = []
-    if ep_markers:
+    if season and episode:
         episode_files = [
             f for f in video_files
-            if any(marker in _video_file_path(f).lower() for marker in ep_markers)
+            if _episode_file_matches(f, season, episode)
         ]
+        if not episode_files:
+            return None
 
     pool = episode_files or video_files
     if not pool:
@@ -1715,13 +1728,6 @@ def _try_resolve_one(candidate, api_token, season, episode, cancel_event,
     Returns a {"url", "headers", "name"} dict on success, None on failure.
     Runs in a worker thread — must be thread-safe.
     """
-    ep_markers = []
-    if season and episode:
-        ep_markers = [
-            f"s{int(season):02d}e{int(episode):02d}",
-            f"{season}x{int(episode):02d}",
-        ]
-
     h8 = candidate['hash'][:8]
     rd_id = None
     ep_link_idx = 0  # which link index to unrestrict (used for cached season packs)
@@ -1767,7 +1773,7 @@ def _try_resolve_one(candidate, api_token, season, episode, cancel_event,
         if status == "downloaded":
             # Season pack already cached: find the right link for this episode.
             # RD returns files and links in the same order (selected files only).
-            if ep_markers:
+            if season and episode:
                 files = info.get("files") or []
                 selected = [f for f in files if f.get("selected") == 1]
                 matches = []
@@ -1775,10 +1781,10 @@ def _try_resolve_one(candidate, api_token, season, episode, cancel_event,
                     fname = f.get("path", "").lower()
                     if _skip_advertised_av1_before_resolve(fname):
                         continue
-                    if any(m in fname for m in ep_markers):
+                    if _episode_file_matches(f, season, episode):
                         matches.append((idx, f))
                 if not matches:
-                    _log(f"{h8} no non-AV1 episode file in selected season pack")
+                    _log(f"{h8} no non-AV1 {_episode_label(season, episode)} file in selected season pack")
                     _rd_delete(f"/torrents/delete/{rd_id}", api_token)
                     return None
                 if matches:
@@ -1790,7 +1796,7 @@ def _try_resolve_one(candidate, api_token, season, episode, cancel_event,
                         ),
                     )
                     _log(f"{h8} season pack: using link[{ep_link_idx}] "
-                         f"for {ep_markers[0]} ({best_file.get('path', '')})")
+                         f"for {_episode_label(season, episode)} ({best_file.get('path', '')})")
         elif status == "waiting_files_selection":
             files = info.get("files") or []
             best_file_id = None
@@ -1802,7 +1808,7 @@ def _try_resolve_one(candidate, api_token, season, episode, cancel_event,
                     continue
                 if _skip_advertised_av1_before_resolve(fname):
                     continue
-                if ep_markers and not any(m in fname for m in ep_markers):
+                if season and episode and not _episode_file_matches(f, season, episode):
                     continue
                 episode_files.append(f)
             if episode_files:
@@ -1814,6 +1820,10 @@ def _try_resolve_one(candidate, api_token, season, episode, cancel_event,
                     ),
                 )
                 best_file_id = best_file.get("id")
+            elif season and episode:
+                _log(f"{h8} no non-AV1 {_episode_label(season, episode)} file in {len(files)} files")
+                _rd_delete(f"/torrents/delete/{rd_id}", api_token)
+                return None
             # Second pass: any video file
             if not best_file_id:
                 best_rank = None
