@@ -41,6 +41,7 @@ _RD_AUTH_FAILURE = _AUTH_FAILURE
 _RD_BLOCKED_HASH_KEY = "blocked_hash"
 _PROVIDER_RD = "realdebrid"
 _PROVIDER_AD = "alldebrid"
+_AUTH_NOTICE_SHOWN = set()
 
 _VIDEO_EXTS = (".mkv", ".mp4", ".avi", ".m4v", ".webm", ".ts")
 _AV1_TOKEN_RE = re.compile(r"(^|[^a-z0-9])(?:av1|av01)([^a-z0-9]|$)", re.I)
@@ -52,6 +53,7 @@ _NON_AV1_CODEC_MARKERS = (
     b"v_mpeg4/iso/asp", b"v_mpeg2", b"v_vp8", b"v_vp9",
 )
 _AUDIO_PROBE_BYTES = 4 * 1024 * 1024
+_EPISODE_PROBE_BYTES = 4 * 1024 * 1024
 _AUDIO_LANG_ALIASES = {
     "en": "en", "eng": "en", "english": "en",
     "ja": "ja", "jpn": "ja", "jap": "ja", "japanese": "ja",
@@ -342,6 +344,72 @@ def _probe_actual_av1_stream(url, headers=None):
         if result is not None:
             return result
 
+    return None
+
+
+def _sample_stream_edges(url, headers=None, size=_EPISODE_PROBE_BYTES):
+    samples = []
+    start_sample = _read_url_sample(url, headers, size=size)
+    if start_sample:
+        samples.append(start_sample)
+
+    length = _remote_content_length(url, headers)
+    if length > size:
+        end_sample = _read_url_sample(
+            url, headers, start=max(0, length - size), size=size
+        )
+        if end_sample:
+            samples.append(end_sample)
+    return samples
+
+
+def _sample_text(samples):
+    chunks = []
+    for sample in samples or []:
+        if not sample:
+            continue
+        chunks.append(sample.decode("utf-8", "ignore"))
+        chunks.append(sample.decode("latin-1", "ignore"))
+    return _normalize_text(" ".join(chunks))
+
+
+def _probe_episode_identity_stream(url, headers=None, season=None, episode=None,
+                                   episode_title=None):
+    """
+    Return True when direct metadata points at the requested episode, False
+    when it points at a different episode in the same season, and None when
+    no trustworthy identity metadata is visible quickly.
+    """
+    if not season or not episode:
+        return True
+
+    wanted = (_safe_int(season), _safe_int(episode))
+    if not wanted[0] or not wanted[1]:
+        return None
+
+    text = _sample_text(_sample_stream_edges(url, headers))
+    if not text:
+        return None
+
+    keys = _extract_episode_keys(text)
+    if wanted in keys:
+        return True
+
+    conflicting = sorted(
+        key for key in keys
+        if key[0] == wanted[0] and key[1] != wanted[1]
+    )
+    if conflicting:
+        label = ", ".join(f"S{s:02d}E{e:02d}" for s, e in conflicting[:3])
+        _log(
+            f"Episode identity probe found conflicting metadata {label}; "
+            f"wanted {_episode_label(season, episode)}",
+            xbmc.LOGWARNING,
+        )
+        return False
+
+    if episode_title and _title_sequence_rank(text, episode_title) is not None:
+        return True
     return None
 
 
@@ -646,19 +714,7 @@ def _probe_audio_language_stream(url, headers=None, preferred=None):
     if not preferred:
         return True
 
-    samples = []
-    start_sample = _read_url_sample(url, headers, size=_AUDIO_PROBE_BYTES)
-    if start_sample:
-        samples.append(start_sample)
-
-    length = _remote_content_length(url, headers)
-    if length > _AUDIO_PROBE_BYTES:
-        end_sample = _read_url_sample(
-            url, headers, start=max(0, length - _AUDIO_PROBE_BYTES),
-            size=_AUDIO_PROBE_BYTES,
-        )
-        if end_sample:
-            samples.append(end_sample)
+    samples = _sample_stream_edges(url, headers, size=_AUDIO_PROBE_BYTES)
 
     tracks = []
     for sample in samples:
@@ -987,15 +1043,30 @@ def _candidate_episode_keys(entry):
     return keys
 
 
+def _candidate_episode_match_kind(entry, season, episode):
+    if not season or not episode:
+        return "none"
+    wanted = (_safe_int(season), _safe_int(episode))
+    keys = _candidate_episode_keys(entry)
+    if keys:
+        return "exact" if wanted in keys else "conflict"
+
+    title_rank = _episode_match_rank(entry.get("title", ""), season, episode)
+    if title_rank == 0:
+        return "exact"
+    if title_rank == 2:
+        return "conflict"
+    if _title_has_season_pack_signal(entry.get("title", ""), season):
+        return "ambiguous_pack"
+    return "unknown"
+
+
 def _candidate_contains_episode(entry, season, episode):
     if not season or not episode:
         return True
-    wanted = (_safe_int(season), _safe_int(episode))
-    keys = _candidate_episode_keys(entry)
-    if not keys:
-        # Season-pack titles often omit individual episode names; allow them.
-        return _episode_match_rank(entry.get("title", ""), season, episode) < 2
-    return wanted in keys
+    return _candidate_episode_match_kind(entry, season, episode) in (
+        "exact", "ambiguous_pack", "unknown",
+    )
 
 
 def _season_episode_coverage(entry, season):
@@ -1079,6 +1150,19 @@ def _pack_sort_rank(entry, season, episode, preference):
     return pack_rank
 
 
+def _episode_specificity_rank(entry, season, episode):
+    kind = _candidate_episode_match_kind(entry, season, episode)
+    if kind == "exact":
+        return 0
+    if kind == "ambiguous_pack":
+        return 2
+    if kind == "unknown":
+        return 3
+    if kind == "conflict":
+        return 9
+    return 4
+
+
 def _filter_movie_results(results, movie_title, year, strict=False):
     filtered = list(results)
 
@@ -1159,14 +1243,27 @@ def _filter_tv_results(results, show_title, season, episode, strict=False):
                  xbmc.LOGWARNING)
 
     if season and episode:
-        episode_matches = [
+        possible_matches = [
             result for result in filtered
             if _episode_match_rank(result.get("title", ""), season, episode) < 2
             and _candidate_contains_episode(result, season, episode)
         ]
-        if episode_matches:
-            _log(f"Episode filter: {len(filtered)} -> {len(episode_matches)} results for E{int(episode):02d}")
-            filtered = episode_matches
+        exact_matches = [
+            result for result in possible_matches
+            if _candidate_episode_match_kind(result, season, episode) == "exact"
+        ]
+        if exact_matches:
+            _log(
+                f"Episode filter: {len(filtered)} -> {len(exact_matches)} "
+                f"exact result(s) for E{int(episode):02d}"
+            )
+            filtered = exact_matches
+        elif possible_matches:
+            _log(
+                f"Episode filter: {len(filtered)} -> {len(possible_matches)} "
+                f"possible result(s) for E{int(episode):02d}"
+            )
+            filtered = possible_matches
         elif strict:
             _log(f"Episode filter removed all {len(filtered)} results for E{int(episode):02d}", xbmc.LOGWARNING)
             return []
@@ -1197,14 +1294,22 @@ def _build_movie_sort_key(quality_sort_key, movie_title, year):
     return _sort_key
 
 
-def _build_tv_sort_key(quality_sort_key, show_title, season, episode, pack_preference):
+def _build_tv_sort_key(quality_sort_key, show_title, season, episode,
+                       pack_preference, episode_title=None):
     def _sort_key(entry):
         title = entry.get("title") or ""
         title_rank = _title_sequence_rank(title, show_title) or (9, 99)
         season_rank = _season_match_rank(title, season)
         episode_rank = _episode_match_rank(title, season, episode)
+        specificity_rank = _episode_specificity_rank(entry, season, episode)
+        episode_title_rank = 1
+        if episode_title and _title_sequence_rank(title, episode_title) is not None:
+            episode_title_rank = 0
         pack_rank = _pack_sort_rank(entry, season, episode, pack_preference)
-        return title_rank + (pack_rank, episode_rank, season_rank) + quality_sort_key(entry)
+        return title_rank + (
+            specificity_rank, episode_title_rank, episode_rank, season_rank,
+            pack_rank,
+        ) + quality_sort_key(entry)
 
     return _sort_key
 
@@ -1415,6 +1520,33 @@ def _provider_label(provider):
 
 def _provider_short(provider):
     return "AD" if provider == _PROVIDER_AD else "RD"
+
+
+def _provider_auth_notice(provider, reason=None):
+    label = _provider_label(provider)
+    reason_text = f" ({reason})" if reason else ""
+    return (
+        f"{label} was previously authorized but now rejects the stored "
+        f"authorization{reason_text}. Re-authorize {label} in KDMM settings."
+    )
+
+
+def _notify_provider_auth_failure(provider, reason=None):
+    key = (provider, reason or "")
+    if key in _AUTH_NOTICE_SHOWN:
+        return
+    _AUTH_NOTICE_SHOWN.add(key)
+    message = _provider_auth_notice(provider, reason)
+    _log(message, xbmc.LOGWARNING)
+    try:
+        xbmcgui.Dialog().notification(
+            "KDMM authorization",
+            message,
+            xbmcgui.NOTIFICATION_ERROR,
+            10000,
+        )
+    except Exception as exc:
+        _log(f"Auth failure notification failed: {exc}", xbmc.LOGWARNING)
 
 
 def _get_debrid_accounts():
@@ -1722,7 +1854,7 @@ def _pick_best_file(files, candidate, season, episode, query_title=None, year=No
 
 
 def _try_resolve_one(candidate, api_token, season, episode, cancel_event,
-                     query_title=None, year=None):
+                     query_title=None, year=None, episode_title=None):
     """
     Try to resolve a single candidate hash via RD direct-add.
     Returns a {"url", "headers", "name"} dict on success, None on failure.
@@ -1731,6 +1863,7 @@ def _try_resolve_one(candidate, api_token, season, episode, cancel_event,
     h8 = candidate['hash'][:8]
     rd_id = None
     ep_link_idx = 0  # which link index to unrestrict (used for cached season packs)
+    source_file = ""
     try:
         if _cancelled(cancel_event):
             return None
@@ -1797,9 +1930,11 @@ def _try_resolve_one(candidate, api_token, season, episode, cancel_event,
                     )
                     _log(f"{h8} season pack: using link[{ep_link_idx}] "
                          f"for {_episode_label(season, episode)} ({best_file.get('path', '')})")
+                    source_file = _video_file_path(best_file)
         elif status == "waiting_files_selection":
             files = info.get("files") or []
             best_file_id = None
+            best_file = None
             # First pass: match episode if applicable
             episode_files = []
             for f in files:
@@ -1820,6 +1955,7 @@ def _try_resolve_one(candidate, api_token, season, episode, cancel_event,
                     ),
                 )
                 best_file_id = best_file.get("id")
+                source_file = _video_file_path(best_file)
             elif season and episode:
                 _log(f"{h8} no non-AV1 {_episode_label(season, episode)} file in {len(files)} files")
                 _rd_delete(f"/torrents/delete/{rd_id}", api_token)
@@ -1835,10 +1971,12 @@ def _try_resolve_one(candidate, api_token, season, episode, cancel_event,
                             and (best_rank is None or (_av1_text_rank(fname), -fsize) < best_rank)):
                         best_rank = (_av1_text_rank(fname), -fsize)
                         best_file_id = f.get("id")
+                        best_file = f
             if not best_file_id:
                 _log(f"{h8} no non-AV1 video file in {len(files)} files")
                 _rd_delete(f"/torrents/delete/{rd_id}", api_token)
                 return None
+            source_file = source_file or _video_file_path(best_file)
 
             _rd_post(f"/torrents/selectFiles/{rd_id}", api_token,
                      data={"files": str(best_file_id)})
@@ -1885,6 +2023,19 @@ def _try_resolve_one(candidate, api_token, season, episode, cancel_event,
             rd_id = None
             return None
 
+        episode_probe = _probe_episode_identity_stream(
+            url, season=season, episode=episode, episode_title=episode_title
+        )
+        if episode_probe is False:
+            _log(
+                f"{h8} resolved stream skipped; identity metadata does not match "
+                f"{_episode_label(season, episode)}: {filename!r}",
+                xbmc.LOGWARNING,
+            )
+            _rd_delete(f"/torrents/delete/{rd_id}", api_token)
+            rd_id = None
+            return None
+
         audio_preference = _preferred_audio_language()
         audio_probe = _probe_audio_language_stream(url, preferred=audio_preference)
         if audio_probe is False:
@@ -1899,7 +2050,7 @@ def _try_resolve_one(candidate, api_token, season, episode, cancel_event,
 
         if url:
             url_refreshed = False
-            if _actual_av1_probe_enabled() or bool(audio_preference):
+            if _actual_av1_probe_enabled() or bool(audio_preference) or episode_probe is not None:
                 # Some RD direct URLs do not survive a metadata range probe.
                 # Get a fresh playback URL after probing so Kodi opens cleanly.
                 fresh = _rd_post("/unrestrict/link", api_token, data={"link": link_to_use})
@@ -1916,10 +2067,12 @@ def _try_resolve_one(candidate, api_token, season, episode, cancel_event,
                 "url": url,
                 "headers": {},
                 "name": filename,
+                "source_file": source_file,
                 "hash": candidate.get("hash"),
                 "title": candidate.get("title", ""),
                 "pack_scope": candidate.get("pack_scope", ""),
                 "pack_rank": candidate.get("pack_rank"),
+                "episode_identity_probe": "matched" if episode_probe is True else "unknown",
                 "av1_probe": "not_av1" if av1_probe is False else "unknown",
                 "audio_language_preference": audio_preference,
                 "audio_language_probe": "matched" if audio_probe is True else "unknown",
@@ -1949,7 +2102,7 @@ def _try_resolve_one(candidate, api_token, season, episode, cancel_event,
 
 
 def _try_resolve_one_ad(candidate, api_token, season, episode, cancel_event,
-                        query_title=None, year=None):
+                        query_title=None, year=None, episode_title=None):
     """
     Try to resolve a single candidate hash via AllDebrid.
     Returns a playable candidate dict on success, None on failure.
@@ -2010,6 +2163,7 @@ def _try_resolve_one_ad(candidate, api_token, season, episode, cancel_event,
             return None
 
         link_to_use = best_file.get("link")
+        source_file = _video_file_path(best_file)
         unlocked = _ad_post("/link/unlock", api_token, data={"link": link_to_use}, timeout=10)
         url = unlocked.get("link")
         filename = unlocked.get("filename") or best_file.get("filename") or candidate.get("title", "Stream")
@@ -2022,6 +2176,19 @@ def _try_resolve_one_ad(candidate, api_token, season, episode, cancel_event,
             return None
         if av1_probe is None and (is_av1_stream(filename) or is_av1_stream(url)):
             _log(f"{h8} resolved AD AV1 stream skipped: {filename!r}", xbmc.LOGWARNING)
+            _ad_delete_magnet(ad_id, api_token)
+            ad_id = None
+            return None
+
+        episode_probe = _probe_episode_identity_stream(
+            url, season=season, episode=episode, episode_title=episode_title
+        )
+        if episode_probe is False:
+            _log(
+                f"{h8} resolved AD stream skipped; identity metadata does not match "
+                f"{_episode_label(season, episode)}: {filename!r}",
+                xbmc.LOGWARNING,
+            )
             _ad_delete_magnet(ad_id, api_token)
             ad_id = None
             return None
@@ -2040,7 +2207,7 @@ def _try_resolve_one_ad(candidate, api_token, season, episode, cancel_event,
 
         if url:
             url_refreshed = False
-            if _actual_av1_probe_enabled() or bool(audio_preference):
+            if _actual_av1_probe_enabled() or bool(audio_preference) or episode_probe is not None:
                 fresh = _ad_post("/link/unlock", api_token, data={"link": link_to_use}, timeout=10)
                 url = fresh.get("link") or url
                 filename = fresh.get("filename", filename)
@@ -2056,10 +2223,12 @@ def _try_resolve_one_ad(candidate, api_token, season, episode, cancel_event,
                 "url": url,
                 "headers": {},
                 "name": filename,
+                "source_file": source_file,
                 "hash": candidate.get("hash"),
                 "title": candidate.get("title", ""),
                 "pack_scope": candidate.get("pack_scope", ""),
                 "pack_rank": candidate.get("pack_rank"),
+                "episode_identity_probe": "matched" if episode_probe is True else "unknown",
                 "av1_probe": "not_av1" if av1_probe is False else "unknown",
                 "audio_language_preference": audio_preference,
                 "audio_language_probe": "matched" if audio_probe is True else "unknown",
@@ -2071,8 +2240,8 @@ def _try_resolve_one_ad(candidate, api_token, season, episode, cancel_event,
         ad_id = None
         return None
 
-    except PermissionError:
-        _log(f"{h8} AD auth rejected", xbmc.LOGWARNING)
+    except PermissionError as exc:
+        _log(f"{h8} AD auth rejected: {exc}", xbmc.LOGWARNING)
         if ad_id:
             _ad_delete_magnet(ad_id, api_token)
         return _AUTH_FAILURE
@@ -2085,7 +2254,8 @@ def _try_resolve_one_ad(candidate, api_token, season, episode, cancel_event,
 
 def _resolve_by_direct_add(candidates_info, api_token, season=None, episode=None,
                            max_resolve=1, cancel_event=None, query_title=None,
-                           year=None, blocked_hashes=None, provider=_PROVIDER_RD):
+                           year=None, blocked_hashes=None, provider=_PROVIDER_RD,
+                           episode_title=None):
     """
     Resolve streams by adding magnets to a debrid provider and checking cache.
     Runs candidates in small batches to avoid provider rate-limits,
@@ -2123,7 +2293,7 @@ def _resolve_by_direct_add(candidates_info, api_token, season=None, episode=None
         futures = {
             pool.submit(
                 resolver, c, api_token, season, episode, combined,
-                query_title, year
+                query_title, year, episode_title
             ): c
             for c in batch
         }
@@ -2278,7 +2448,7 @@ def is_stream_accessible(url, headers):
 
 def fetch_all_cached_streams(catalog_type, video_id, cancel_event=None,
                              query_title=None, year=None, userdata_path=None,
-                             ignore_pack_binding=False):
+                             ignore_pack_binding=False, episode_title=None):
     """
     Main entry point.  Queries DMM's hash database, then resolves cached
     streams via configured debrid providers.  Returns a sorted list of
@@ -2349,11 +2519,12 @@ def fetch_all_cached_streams(catalog_type, video_id, cancel_event=None,
                             [bound_candidate], account["token"], season=season, episode=episode,
                             max_resolve=1, cancel_event=cancel_event,
                             query_title=query_title, year=year, blocked_hashes=blocked_hashes,
-                            provider=provider,
+                            provider=provider, episode_title=episode_title,
                         )
                     except PermissionError as exc:
                         _log(f"{_provider_short(provider)} auth failed while trying bound pack: {exc}",
                              xbmc.LOGWARNING)
+                        _notify_provider_auth_failure(provider, str(exc))
                         continue
                     if blocked_cache and blocked_hashes:
                         blocked_cache.mark_many(blocked_hashes)
@@ -2424,7 +2595,10 @@ def fetch_all_cached_streams(catalog_type, video_id, cancel_event=None,
     if catalog_type != "movie":
         sorted_dmm = sorted(
             dmm_results,
-            key=_build_tv_sort_key(sort_key, query_title, season, episode, tv_pack_preference)
+            key=_build_tv_sort_key(
+                sort_key, query_title, season, episode, tv_pack_preference,
+                episode_title=episode_title,
+            )
         )
     else:
         sorted_dmm = sorted(dmm_results, key=_build_movie_sort_key(sort_key, query_title, year))
@@ -2501,12 +2675,13 @@ def fetch_all_cached_streams(catalog_type, video_id, cancel_event=None,
                     max_resolve=3, cancel_event=cancel_event,
                     query_title=query_title, year=year,
                     blocked_hashes=blocked_hashes,
-                    provider=provider,
+                    provider=provider, episode_title=episode_title,
                 )
             except PermissionError as exc:
                 _log(f"{_provider_short(provider)} auth failed; trying next provider: {exc}",
                      xbmc.LOGWARNING)
                 auth_failed_providers.add(provider)
+                _notify_provider_auth_failure(provider, str(exc))
                 continue
             if blocked_cache and blocked_hashes:
                 blocked_cache.mark_many(blocked_hashes)
@@ -2523,9 +2698,13 @@ def fetch_all_cached_streams(catalog_type, video_id, cancel_event=None,
             "KDMM", "No cached streams found for this title on configured debrid accounts",
             xbmcgui.NOTIFICATION_WARNING, 6000)
     else:
-        _log(f"Resolved {len(resolved)} stream(s), top: {resolved[0]['name']!r} "
-             f"via {resolved[0].get('provider_label', 'debrid')}")
         top = resolved[0]
+        source = top.get("source_file") or top.get("title") or top["name"]
+        _log(
+            f"Resolved {len(resolved)} stream(s), top: {top['name']!r} "
+            f"via {top.get('provider_label', 'debrid')} "
+            f"from {source!r} ({(top.get('hash') or '')[:8]})"
+        )
         if pack_cache and top.get("pack_rank") in (0, 1):
             pack_cache.set(
                 imdb_id, season, top.get("hash"), title=top.get("title", ""),

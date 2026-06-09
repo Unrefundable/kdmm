@@ -366,6 +366,15 @@ def refresh_token():
         # don’t keep trying. User will need to re-authorize.
         if _is_token_expired_error(exc):
             _log("Clearing invalid tokens — re-authorization required", xbmc.LOGWARNING)
+            try:
+                xbmcgui.Dialog().notification(
+                    "KDMM authorization",
+                    "Real-Debrid was previously authorized, but the stored authorization is now rejected. Re-authorize Real-Debrid in KDMM settings.",
+                    xbmcgui.NOTIFICATION_ERROR,
+                    10000,
+                )
+            except Exception as notify_exc:
+                _log(f"Auth failure notification failed: {notify_exc}", xbmc.LOGWARNING)
             _write_tokens({})
         return None
 
