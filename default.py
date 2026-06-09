@@ -203,6 +203,15 @@ def _cache_needs_refresh(cached):
     return any(_candidate_has_probe_consumed_url(c) for c in candidates if isinstance(c, dict))
 
 
+def _episode_cache_needs_identity_refresh(cached):
+    candidates = cached if isinstance(cached, list) else [cached]
+    return any(
+        isinstance(candidate, dict)
+        and candidate.get("episode_identity_probe") not in ("matched", "unknown")
+        for candidate in candidates
+    )
+
+
 def _authorize_debrid_account():
     choice = xbmcgui.Dialog().select(
         "KDMM - Authorization Required",
@@ -213,6 +222,29 @@ def _authorize_debrid_account():
     if choice == 1:
         return ad_authorize()
     return False
+
+
+def _auth_error_notice(error_code):
+    code = (error_code or "").strip()
+    if code == "no_debrid_token":
+        return (
+            "No valid Real-Debrid or AllDebrid authorization is configured.",
+            "Authorize a debrid account now to continue watching?",
+        )
+    if "alldebrid" in code and "realdebrid" not in code:
+        return (
+            "AllDebrid was previously authorized, but the stored authorization is now rejected.",
+            "Re-authorize AllDebrid now to continue watching?",
+        )
+    if "realdebrid" in code and "alldebrid" not in code:
+        return (
+            "Real-Debrid was previously authorized, but the stored authorization is now rejected.",
+            "Re-authorize Real-Debrid now to continue watching?",
+        )
+    return (
+        "All configured debrid authorizations are now rejected.",
+        "Re-authorize Real-Debrid or AllDebrid now to continue watching?",
+    )
 
 
 def _wait_for_fetch(thread, cancel_event):
@@ -287,6 +319,10 @@ def action_play(params):
                 _log(f"Refreshing {media_id}; cached URL may have been consumed by codec probe")
                 stream_cache.clear(media_id)
                 cached = None
+            elif catalog_type == "series" and _episode_cache_needs_identity_refresh(cached):
+                _log(f"Refreshing {media_id}; cached episode stream predates identity checks")
+                stream_cache.clear(media_id)
+                cached = None
             if cached:
                 cached_hash = ""
                 if isinstance(cached, list) and cached:
@@ -325,9 +361,11 @@ def action_play(params):
                     catalog_type, video_id, cancel_event=cancel_event,
                     query_title=query_title, year=year,
                     userdata_path=_USERDATA_PATH,
-                    ignore_pack_binding=force_refresh)
-            except PermissionError:
+                    ignore_pack_binding=force_refresh,
+                    episode_title=title if catalog_type == "series" else None)
+            except PermissionError as exc:
                 fetch_result["needs_auth"] = True
+                fetch_result["auth_error"] = str(exc)
             except Exception as exc:
                 fetch_result["error"] = exc
 
@@ -340,11 +378,19 @@ def action_play(params):
 
         # Auth token missing or expired — prompt user to authorize a provider (main thread)
         if fetch_result.get("needs_auth"):
-            _log("No debrid token – prompting user to authorize")
+            auth_error = fetch_result.get("auth_error") or "no_debrid_token"
+            notice, question = _auth_error_notice(auth_error)
+            _log(f"Debrid authorization problem ({auth_error}) – prompting user to authorize",
+                 xbmc.LOGWARNING)
+            xbmcgui.Dialog().notification(
+                "KDMM authorization",
+                notice,
+                xbmcgui.NOTIFICATION_ERROR,
+                10000,
+            )
             if xbmcgui.Dialog().yesno(
                 "KDMM – Authorization Required",
-                "No valid Real-Debrid or AllDebrid authorization is configured.[CR]"
-                "Authorize a debrid account now to continue watching?",
+                f"{notice}[CR]{question}",
                 yeslabel="Authorize",
                 nolabel="Cancel",
             ):
@@ -364,8 +410,10 @@ def action_play(params):
                 xbmcplugin.setResolvedUrl(ADDON_HANDLE, False, xbmcgui.ListItem())
                 return
             if fetch_result.get("needs_auth"):
+                auth_error = fetch_result.get("auth_error") or "no_debrid_token"
+                notice, _question = _auth_error_notice(auth_error)
                 xbmcgui.Dialog().notification(
-                    "KDMM", "Still no debrid token after auth. Check addon settings.",
+                    "KDMM", f"Authorization still rejected. {notice}",
                     xbmcgui.NOTIFICATION_ERROR, 8000)
                 xbmcplugin.setResolvedUrl(ADDON_HANDLE, False, xbmcgui.ListItem())
                 return
