@@ -44,6 +44,13 @@ _PROVIDER_AD = "alldebrid"
 _AUTH_NOTICE_SHOWN = set()
 
 _VIDEO_EXTS = (".mkv", ".mp4", ".avi", ".m4v", ".webm", ".ts")
+_NON_MAIN_VIDEO_DIRS = {
+    "extras", "extra", "featurettes", "sample", "samples", "screens",
+    "screenshot", "screenshots", "sub", "subs", "subtitle", "subtitles",
+}
+_GENERIC_VIDEO_BASENAMES = {
+    "video", "movie", "film", "file", "default", "stream", "download",
+}
 _AV1_TOKEN_RE = re.compile(r"(^|[^a-z0-9])(?:av1|av01)([^a-z0-9]|$)", re.I)
 _CODEC_PROBE_BYTES = 2 * 1024 * 1024
 _AV1_CODEC_MARKERS = (b"av01", b"v_av1")
@@ -745,6 +752,13 @@ def candidate_matches_audio_preference(candidate):
     return candidate.get("audio_language_probe") in ("matched", "unknown")
 
 
+def candidate_matches_episode_identity(candidate, season=None, episode=None,
+                                       episode_title=None):
+    return _episode_stream_identity_is_safe(
+        candidate, season=season, episode=episode, episode_title=episode_title
+    )
+
+
 def _normalize_text(text):
     text = html.unescape(text or "")
     text = unicodedata.normalize("NFKD", text)
@@ -986,6 +1000,8 @@ def _episode_file_matches(file_info, season, episode):
     if not season or not episode:
         return True
     path = _video_file_path(file_info)
+    if _video_path_is_non_main(path):
+        return False
     return (
         _episode_match_rank(path, season, episode) == 0
         and _season_match_rank(path, season) < 2
@@ -1010,6 +1026,67 @@ def _video_file_path(file_info):
     )
 
 
+def _video_path_components(path):
+    path = str(path or "").replace("\\", "/")
+    return [part for part in path.split("/") if part]
+
+
+def _video_path_is_non_main(path):
+    parts = _video_path_components(path)
+    for part in parts[:-1]:
+        normalized = _normalize_text(part).strip(" ._-")
+        if normalized in _NON_MAIN_VIDEO_DIRS:
+            return True
+    return False
+
+
+def _video_basename(path):
+    parts = _video_path_components(path)
+    return parts[-1] if parts else str(path or "")
+
+
+def _video_stem(path):
+    basename = _video_basename(path)
+    stem = basename.rsplit(".", 1)[0] if "." in basename else basename
+    return _normalize_text(stem).strip(" ._-")
+
+
+def _video_filename_has_episode_identity(path, season, episode, episode_title=None):
+    basename = _video_basename(path)
+    if not basename:
+        return False
+    if season and episode and _episode_match_rank(basename, season, episode) == 0:
+        return True
+    return bool(episode_title and _title_sequence_rank(basename, episode_title) is not None)
+
+
+def _video_filename_is_generic(path):
+    stem = _video_stem(path)
+    if not stem:
+        return True
+    if stem in _GENERIC_VIDEO_BASENAMES:
+        return True
+    return bool(re.fullmatch(r"(?:video|movie|film|file|stream|download)[ ._-]*\d{0,3}", stem))
+
+
+def _episode_stream_identity_is_safe(candidate, season=None, episode=None, episode_title=None):
+    if not season or not episode or not isinstance(candidate, dict):
+        return True
+    if candidate.get("episode_identity_probe") == "matched":
+        return True
+    source_file = candidate.get("source_file") or ""
+    filename = candidate.get("name") or candidate.get("filename") or ""
+    if _video_path_is_non_main(source_file):
+        return False
+    if _video_filename_has_episode_identity(filename, season, episode, episode_title):
+        return True
+    if _video_filename_has_episode_identity(source_file, season, episode, episode_title):
+        return not _video_filename_is_generic(source_file)
+    if _video_filename_is_generic(filename) or _video_filename_is_generic(source_file):
+        return False
+    return False
+
+
 def _video_file_size(file_info):
     if not isinstance(file_info, dict):
         return 0
@@ -1029,7 +1106,7 @@ def _candidate_video_files(entry):
         files = files.values()
     for f in files:
         path = _video_file_path(f)
-        if path and path.lower().endswith(_VIDEO_EXTS):
+        if path and path.lower().endswith(_VIDEO_EXTS) and not _video_path_is_non_main(path):
             video_files.append(f)
     return video_files
 
@@ -2035,6 +2112,25 @@ def _try_resolve_one(candidate, api_token, season, episode, cancel_event,
             _rd_delete(f"/torrents/delete/{rd_id}", api_token)
             rd_id = None
             return None
+        if not _episode_stream_identity_is_safe(
+            {
+                "name": filename,
+                "source_file": source_file,
+                "episode_identity_probe": "matched" if episode_probe is True else "unknown",
+            },
+            season=season,
+            episode=episode,
+            episode_title=episode_title,
+        ):
+            _log(
+                f"{h8} resolved stream skipped; generic/unverified episode "
+                f"identity for {_episode_label(season, episode)}: "
+                f"{source_file or filename!r}",
+                xbmc.LOGWARNING,
+            )
+            _rd_delete(f"/torrents/delete/{rd_id}", api_token)
+            rd_id = None
+            return None
 
         audio_preference = _preferred_audio_language()
         audio_probe = _probe_audio_language_stream(url, preferred=audio_preference)
@@ -2187,6 +2283,25 @@ def _try_resolve_one_ad(candidate, api_token, season, episode, cancel_event,
             _log(
                 f"{h8} resolved AD stream skipped; identity metadata does not match "
                 f"{_episode_label(season, episode)}: {filename!r}",
+                xbmc.LOGWARNING,
+            )
+            _ad_delete_magnet(ad_id, api_token)
+            ad_id = None
+            return None
+        if not _episode_stream_identity_is_safe(
+            {
+                "name": filename,
+                "source_file": source_file,
+                "episode_identity_probe": "matched" if episode_probe is True else "unknown",
+            },
+            season=season,
+            episode=episode,
+            episode_title=episode_title,
+        ):
+            _log(
+                f"{h8} resolved AD stream skipped; generic/unverified episode "
+                f"identity for {_episode_label(season, episode)}: "
+                f"{source_file or filename!r}",
                 xbmc.LOGWARNING,
             )
             _ad_delete_magnet(ad_id, api_token)

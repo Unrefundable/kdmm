@@ -50,6 +50,7 @@ sys.path.insert(0, os.path.join(_ADDON_PATH, "lib"))
 
 from cache import StreamCache, ProgressCache, PackBindingCache        # noqa: E402 (after sys.path)
 from dmm import (    # noqa: E402
+    candidate_matches_episode_identity,
     candidate_matches_audio_preference,
     fetch_all_cached_streams,
     is_av1_stream,
@@ -163,7 +164,7 @@ def _play_stream(media_id, url, headers_dict, imdb, tmdb, title, showtitle,
     xbmcplugin.setResolvedUrl(ADDON_HANDLE, True, li)
 
 
-def _filter_playable_candidates(candidates):
+def _filter_playable_candidates(candidates, season=None, episode=None, episode_title=None):
     if isinstance(candidates, dict):
         candidates = [candidates]
     original = list(candidates or [])
@@ -171,15 +172,32 @@ def _filter_playable_candidates(candidates):
         candidate for candidate in original
         if not is_av1_stream(candidate)
         and candidate_matches_audio_preference(candidate)
+        and candidate_matches_episode_identity(
+            candidate,
+            season=season,
+            episode=episode,
+            episode_title=episode_title,
+        )
     ]
     av1_removed = sum(1 for candidate in original if is_av1_stream(candidate))
-    audio_removed = len(original) - av1_removed - len(filtered)
+    audio_removed = sum(
+        1 for candidate in original
+        if not is_av1_stream(candidate)
+        and not candidate_matches_audio_preference(candidate)
+    )
+    identity_removed = len(original) - av1_removed - audio_removed - len(filtered)
     if av1_removed:
         _log(f"Filtered {av1_removed} cached/resolved AV1 candidate(s)", xbmc.LOGWARNING)
     if audio_removed:
         _log(
             f"Filtered {audio_removed} cached/resolved candidate(s) missing "
             "the current audio language probe",
+            xbmc.LOGWARNING,
+        )
+    if identity_removed:
+        _log(
+            f"Filtered {identity_removed} cached/resolved candidate(s) with "
+            "generic or unverified episode identity",
             xbmc.LOGWARNING,
         )
     return filtered
@@ -331,7 +349,12 @@ def action_play(params):
                     _log(f"Bypassing stale episode cache for {media_id}; bound pack is {bound_pack.get('hash')}")
                 else:
                     _log(f"Cache hit for {media_id}")
-                    candidates = _filter_playable_candidates(cached)
+                    candidates = _filter_playable_candidates(
+                        cached,
+                        season=season,
+                        episode=episode,
+                        episode_title=title,
+                    )
                     if not candidates:
                         _log(f"Cached candidates for {media_id} were AV1 only; refreshing")
                         stream_cache.clear(media_id)
@@ -426,12 +449,17 @@ def action_play(params):
             xbmcplugin.setResolvedUrl(ADDON_HANDLE, False, xbmcgui.ListItem())
             return
 
-        candidates = _filter_playable_candidates(fetch_result.get("candidates") or [])
+        candidates = _filter_playable_candidates(
+            fetch_result.get("candidates") or [],
+            season=season if catalog_type == "series" else None,
+            episode=episode if catalog_type == "series" else None,
+            episode_title=title if catalog_type == "series" else None,
+        )
 
         if not candidates:
             xbmcgui.Dialog().notification(
                 "KDMM",
-                "No non-AV1 cached streams found",
+                "No verified cached streams found",
                 xbmcgui.NOTIFICATION_ERROR, 8000)
             xbmcplugin.setResolvedUrl(ADDON_HANDLE, False, xbmcgui.ListItem())
             return
@@ -440,7 +468,12 @@ def action_play(params):
         _log(f"Stored {len(candidates)} candidate(s) for {media_id}: {candidates[0]['name']!r}")
 
     # ---- 3. Ensure candidates is a list ----------------------------- #
-    candidates = _filter_playable_candidates(candidates)
+    candidates = _filter_playable_candidates(
+        candidates,
+        season=season if catalog_type == "series" else None,
+        episode=episode if catalog_type == "series" else None,
+        episode_title=title if catalog_type == "series" else None,
+    )
 
     # ---- 4. Store full candidate list for service.py retry ----------- #
     chosen_idx = 0
