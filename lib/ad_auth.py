@@ -17,6 +17,8 @@ import xbmcvfs
 _AD_BASE = "https://api.alldebrid.com/v4"
 _AD_BASE_41 = "https://api.alldebrid.com/v4.1"
 _ADDON_ID = "plugin.video.kdmm"
+_SETTING_API_KEY = "ad_api_key"
+_TOKEN_API_KEY = "apikey"
 
 
 def _log(msg, level=xbmc.LOGINFO):
@@ -51,6 +53,36 @@ def _write_tokens(data):
         _log(f"Tokens saved to {real_path}")
     except Exception as exc:
         _log(f"Failed to save tokens: {exc}", xbmc.LOGERROR)
+
+
+def _setting_api_key():
+    try:
+        return xbmcaddon.Addon(_ADDON_ID).getSetting(_SETTING_API_KEY).strip()
+    except Exception as exc:
+        _log(f"Could not read addon settings: {exc}", xbmc.LOGWARNING)
+        return ""
+
+
+def _set_setting_api_key(api_key):
+    try:
+        xbmcaddon.Addon(_ADDON_ID).setSetting(_SETTING_API_KEY, api_key or "")
+        return True
+    except Exception as exc:
+        _log(f"Could not write addon settings: {exc}", xbmc.LOGWARNING)
+        return False
+
+
+def _save_api_key(api_key, source="pin"):
+    api_key = (api_key or "").strip()
+    if not api_key:
+        return False
+    _write_tokens({
+        _TOKEN_API_KEY: api_key,
+        "authorized_at": int(time.time()),
+        "source": source,
+    })
+    _set_setting_api_key(api_key)
+    return True
 
 
 def _get_requests():
@@ -158,7 +190,7 @@ def _show_auth_dialog(pin, check, user_url, expires_in):
 
             data = payload.get("data") or {}
             if data.get("activated") and data.get("apikey"):
-                _write_tokens({"apikey": data.get("apikey", "")})
+                _save_api_key(data.get("apikey", ""), source="pin")
                 with result_lock:
                     result["status"] = "ok"
                 return
@@ -220,18 +252,20 @@ def get_access_token():
     """
     Return an AllDebrid API key from settings or the PIN-flow token store.
     """
-    try:
-        addon = xbmcaddon.Addon()
-        api_key = addon.getSetting("ad_api_key").strip()
-        if api_key:
-            _log("Using API key from addon settings")
-            return api_key
-    except Exception as exc:
-        _log(f"Could not read addon settings: {exc}", xbmc.LOGWARNING)
+    api_key = _setting_api_key()
+    if api_key:
+        _log("Using API key from addon settings")
+        return api_key
 
-    return (_load_tokens().get("apikey") or "").strip() or None
+    stored_key = (_load_tokens().get(_TOKEN_API_KEY) or "").strip()
+    if stored_key:
+        _log("Restoring AllDebrid API key from token store into addon settings")
+        _set_setting_api_key(stored_key)
+        return stored_key
+    return None
 
 
 def revoke():
     _write_tokens({})
+    _set_setting_api_key("")
     _log("AllDebrid authorization revoked")
