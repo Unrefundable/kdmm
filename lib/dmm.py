@@ -1600,12 +1600,7 @@ def _provider_short(provider):
 
 
 def _provider_auth_notice(provider, reason=None):
-    label = _provider_label(provider)
-    reason_text = f" ({reason})" if reason else ""
-    return (
-        f"{label} was previously authorized but now rejects the stored "
-        f"authorization{reason_text}. Re-authorize {label} in KDMM settings."
-    )
+    return f"{_provider_label(provider)} authorization failed"
 
 
 def _notify_provider_auth_failure(provider, reason=None):
@@ -2660,14 +2655,14 @@ def fetch_all_cached_streams(catalog_type, video_id, cancel_event=None,
     except Exception as exc:
         _log(f"DMM hash fetch failed: {exc}", xbmc.LOGERROR)
         xbmcgui.Dialog().notification(
-            "KDMM", f"DMM error: {type(exc).__name__}: {str(exc)[:120]}",
+            "KDMM", "DMM lookup failed",
             xbmcgui.NOTIFICATION_ERROR, 8000)
         return []
 
     if not dmm_results:
         _log(f"No torrents in DMM database for {video_id}")
         xbmcgui.Dialog().notification(
-            "KDMM", f"DMM: no torrents found for {imdb_id}",
+            "KDMM", "No torrents found",
             xbmcgui.NOTIFICATION_WARNING, 5000)
         return []
 
@@ -2685,7 +2680,7 @@ def fetch_all_cached_streams(catalog_type, video_id, cancel_event=None,
     if not dmm_results:
         xbmcgui.Dialog().notification(
             "KDMM",
-            "No non-AV1 torrents matched this title/year",
+            "No playable streams",
             xbmcgui.NOTIFICATION_WARNING, 6000)
         return []
 
@@ -2699,7 +2694,7 @@ def fetch_all_cached_streams(catalog_type, video_id, cancel_event=None,
     if not hash_map:
         _log("No valid hashes from DMM results")
         xbmcgui.Dialog().notification(
-            "KDMM", "DMM returned results but no valid hashes",
+            "KDMM", "No playable streams",
             xbmcgui.NOTIFICATION_WARNING, 5000)
         return []
 
@@ -2810,7 +2805,7 @@ def fetch_all_cached_streams(catalog_type, video_id, cancel_event=None,
 
     if not resolved:
         xbmcgui.Dialog().notification(
-            "KDMM", "No cached streams found for this title on configured debrid accounts",
+            "KDMM", "No playable streams",
             xbmcgui.NOTIFICATION_WARNING, 6000)
     else:
         top = resolved[0]

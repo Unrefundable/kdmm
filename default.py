@@ -246,21 +246,21 @@ def _auth_error_notice(error_code):
     code = (error_code or "").strip()
     if code == "no_debrid_token":
         return (
-            "No valid Real-Debrid or AllDebrid authorization is configured.",
+            "Debrid account required",
             "Authorize a debrid account now to continue watching?",
         )
     if "alldebrid" in code and "realdebrid" not in code:
         return (
-            "AllDebrid was previously authorized, but the stored authorization is now rejected.",
+            "AllDebrid authorization failed",
             "Re-authorize AllDebrid now to continue watching?",
         )
     if "realdebrid" in code and "alldebrid" not in code:
         return (
-            "Real-Debrid was previously authorized, but the stored authorization is now rejected.",
+            "Real-Debrid authorization failed",
             "Re-authorize Real-Debrid now to continue watching?",
         )
     return (
-        "All configured debrid authorizations are now rejected.",
+        "Debrid authorization failed",
         "Re-authorize Real-Debrid or AllDebrid now to continue watching?",
     )
 
@@ -318,7 +318,7 @@ def action_play(params):
 
     if not media_id:
         xbmcgui.Dialog().notification(
-            "KDMM", "No media ID – check player JSON config",
+            "KDMM", "Missing media ID",
             xbmcgui.NOTIFICATION_ERROR,
         )
         return
@@ -436,7 +436,7 @@ def action_play(params):
                 auth_error = fetch_result.get("auth_error") or "no_debrid_token"
                 notice, _question = _auth_error_notice(auth_error)
                 xbmcgui.Dialog().notification(
-                    "KDMM", f"Authorization still rejected. {notice}",
+                    "KDMM", notice,
                     xbmcgui.NOTIFICATION_ERROR, 8000)
                 xbmcplugin.setResolvedUrl(ADDON_HANDLE, False, xbmcgui.ListItem())
                 return
@@ -444,7 +444,7 @@ def action_play(params):
         if "error" in fetch_result:
             _log(f"fetch_all_cached_streams raised: {fetch_result['error']}", xbmc.LOGERROR)
             xbmcgui.Dialog().notification(
-                "KDMM", f"Error: {fetch_result['error']}",
+                "KDMM", "Playback error",
                 xbmcgui.NOTIFICATION_ERROR, 8000)
             xbmcplugin.setResolvedUrl(ADDON_HANDLE, False, xbmcgui.ListItem())
             return
@@ -459,7 +459,7 @@ def action_play(params):
         if not candidates:
             xbmcgui.Dialog().notification(
                 "KDMM",
-                "No verified cached streams found",
+                "No playable streams",
                 xbmcgui.NOTIFICATION_ERROR, 8000)
             xbmcplugin.setResolvedUrl(ADDON_HANDLE, False, xbmcgui.ListItem())
             return
