@@ -1,4 +1,4 @@
-"""KDMM service: resume, retry, and IntroDB-backed skip/next overlays."""
+"""KDMM service: resume and IntroDB-backed skip/next overlays."""
 
 import json
 import os
@@ -22,10 +22,9 @@ _USERDATA_PATH = xbmcvfs.translatePath(
 sys.path.insert(0, os.path.join(_ADDON_PATH, "lib"))
 
 from cache import StreamCache, ProgressCache, PackBindingCache   # noqa: E402
-from dmm import is_av1_stream  # noqa: E402
 from introdb_client import query_all_segments  # noqa: E402
 from next_episode import get_next_episode, play_next_episode  # noqa: E402
-from playback import apply_playback_metadata, decode_playback_context  # noqa: E402
+from playback import decode_playback_context  # noqa: E402
 from segment_overlay import show_skip_overlay  # noqa: E402
 from settings_persistence import get_stream_cache_ttl_hours  # noqa: E402
 
@@ -149,12 +148,6 @@ def _should_show_segment_button(processed_segments, segment_key, current_time,
 
     state["shown_for_entry"] = True
     return True
-
-
-def _candidate_needs_accessibility_check(candidate):
-    # Refreshed debrid URLs are intentionally untouched after the codec probe;
-    # probing them again can make Kodi fail when it opens the stream.
-    return not bool(candidate.get("url_refreshed_after_probe"))
 
 
 class SegmentController:
@@ -389,8 +382,8 @@ class BridgePlayer(xbmc.Player):
         if url:
             self._tried_urls.add(url)
         WIN.clearProperty(PROP_PENDING_PLAYBACK)
-        _log(f"Playback did not start for {media_id}; trying next candidate", xbmc.LOGWARNING)
-        self._try_next_candidate(media_id)
+        _log(f"Playback did not start for {media_id}; clearing failed stream", xbmc.LOGWARNING)
+        self._clear_failed_stream(media_id)
 
     def onAVStarted(self):
         media_id = WIN.getProperty(PROP_MEDIA_ID)
@@ -457,8 +450,8 @@ class BridgePlayer(xbmc.Player):
         if self._current_url:
             self._tried_urls.add(self._current_url)
 
-        _log(f"Playback error for {media_id} – trying next candidate", xbmc.LOGWARNING)
-        self._try_next_candidate(media_id)
+        _log(f"Playback error for {media_id}; clearing failed stream", xbmc.LOGWARNING)
+        self._clear_failed_stream(media_id)
 
     def _handle_playback_stop(self, is_ended):
         media_id = self._current_media_id
@@ -479,13 +472,13 @@ class BridgePlayer(xbmc.Player):
         if 0 < total_time < MIN_CONTENT_SECONDS:
             _log(
                 f"Stream too short ({total_time:.1f}s) for {media_id} "
-                "– treating as failed stream, retrying next candidate",
+                "– treating as failed stream",
                 xbmc.LOGWARNING,
             )
             self._current_media_id = None
             if self._current_url:
                 self._tried_urls.add(self._current_url)
-            self._try_next_candidate(media_id)
+            self._clear_failed_stream(media_id, "Stream failed")
         else:
             self._save_progress(is_ended=is_ended)
             if next_episode:
@@ -506,85 +499,23 @@ class BridgePlayer(xbmc.Player):
 
         threading.Thread(target=_open, daemon=True).start()
 
-    def _try_next_candidate(self, media_id):
-        import json, threading
-        from urllib.parse import urlencode
-        from dmm import is_stream_accessible
-
-        candidates_json = WIN.getProperty(PROP_CANDIDATES)
-        candidates = []
-        if candidates_json:
-            try:
-                candidates = json.loads(candidates_json)
-            except Exception:
-                pass
-
-        next_stream = None
-        for c in candidates:
-            if is_av1_stream(c):
-                _log(f"Candidate {c.get('name', '?')!r} is AV1 – skipping", xbmc.LOGWARNING)
-                continue
-            url = c.get("url", "").split("|")[0]
-            if url in self._tried_urls:
-                continue
-            if (_candidate_needs_accessibility_check(c)
-                    and not is_stream_accessible(url, c.get("headers") or {})):
-                _log(f"Candidate {c.get('name', '?')!r} too small – skipping", xbmc.LOGWARNING)
-                self._tried_urls.add(url)
-                continue
-            next_stream = c
-            break
-
-        if not next_stream:
-            _log(
-                f"All {len(candidates)} candidate(s) failed for {media_id} – clearing cache",
-                xbmc.LOGWARNING,
-            )
-            self._stream_cache.clear(media_id)
-            if media_id and media_id.count(":") >= 2:
-                imdb_id, season, _episode = media_id.split(":", 2)
-                PackBindingCache(_USERDATA_PATH).clear(imdb_id, season)
-            WIN.clearProperty(PROP_CANDIDATES)
-            WIN.clearProperty(PROP_PLAYBACK_CONTEXT)
-            self._playback_context = {}
-            xbmcgui.Dialog().notification(
-                "KDMM",
-                "All available streams failed – cache cleared, please try again",
-                xbmcgui.NOTIFICATION_ERROR,
-                6000,
-            )
-            return
-
-        def _retry():
-            url = next_stream["url"]
-            headers = next_stream.get("headers") or {}
-            self._tried_urls.add(url)
-
-            if headers:
-                final_url = f"{url}|{urlencode(headers)}"
-            else:
-                final_url = url
-
-            li = xbmcgui.ListItem(path=final_url)
-            li.setProperty("IsPlayable", "true")
-            apply_playback_metadata(
-                li,
-                self._playback_context or decode_playback_context(WIN.getProperty(PROP_PLAYBACK_CONTEXT)),
-            )
-            if headers:
-                li.setProperty("inputstream", "inputstream.ffmpegdirect")
-
-            WIN.setProperty(PROP_MEDIA_ID, media_id)
-            WIN.setProperty(PROP_PENDING_PLAYBACK, json.dumps({
-                "media_id": media_id,
-                "url": url,
-                "timestamp": time.time(),
-            }))
-            _log(f"Retrying with next candidate: {next_stream['name']!r}")
-            xbmc.sleep(800)
-            self.play(final_url, li)
-
-        threading.Thread(target=_retry, daemon=True).start()
+    def _clear_failed_stream(self, media_id, message="Playback failed"):
+        self._stream_cache.clear(media_id)
+        if media_id and media_id.count(":") >= 2:
+            imdb_id, season, _episode = media_id.split(":", 2)
+            PackBindingCache(_USERDATA_PATH).clear(imdb_id, season)
+        WIN.clearProperty(PROP_CANDIDATES)
+        WIN.clearProperty(PROP_PLAYBACK_CONTEXT)
+        WIN.clearProperty(PROP_PENDING_PLAYBACK)
+        WIN.clearProperty(PROP_MEDIA_ID)
+        WIN.clearProperty(PROP_RESUME_TIME)
+        self._playback_context = {}
+        xbmcgui.Dialog().notification(
+            "KDMM",
+            message,
+            xbmcgui.NOTIFICATION_ERROR,
+            5000,
+        )
 
     def _save_progress(self, is_ended):
         media_id = self._current_media_id
