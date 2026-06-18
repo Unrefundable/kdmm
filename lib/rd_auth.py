@@ -369,7 +369,7 @@ def refresh_token():
             try:
                 xbmcgui.Dialog().notification(
                     "KDMM authorization",
-                    "Real-Debrid was previously authorized, but the stored authorization is now rejected. Re-authorize Real-Debrid in KDMM settings.",
+                    "Real-Debrid authorization failed",
                     xbmcgui.NOTIFICATION_ERROR,
                     10000,
                 )
