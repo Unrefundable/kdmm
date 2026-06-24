@@ -60,6 +60,7 @@ from playback import apply_playback_metadata, build_playback_context, encode_pla
 from ad_auth import authorize as ad_authorize, revoke as ad_revoke  # noqa: E402
 from rd_auth import authorize as rd_authorize, revoke as rd_revoke  # noqa: E402
 from settings_persistence import get_stream_cache_ttl_hours  # noqa: E402
+from user_messages import describe_failure  # noqa: E402
 
 # ------------------------------------------------------------------ #
 # Constants – window property keys shared with service.py
@@ -248,6 +249,11 @@ def _auth_error_notice(error_code):
         return (
             "Debrid account required",
             "Authorize a debrid account now to continue watching?",
+        )
+    if code == "all_debrid_tokens_rejected":
+        return (
+            "Debrid authorization rejected",
+            "Re-authorize Real-Debrid or AllDebrid now to continue watching?",
         )
     if "alldebrid" in code and "realdebrid" not in code:
         return (
@@ -443,8 +449,10 @@ def action_play(params):
 
         if "error" in fetch_result:
             _log(f"fetch_all_cached_streams raised: {fetch_result['error']}", xbmc.LOGERROR)
+            message = describe_failure(fetch_result["error"], "KDMM", "fetching streams")
             xbmcgui.Dialog().notification(
-                "KDMM", "Playback error",
+                "KDMM playback",
+                message,
                 xbmcgui.NOTIFICATION_ERROR, 8000)
             xbmcplugin.setResolvedUrl(ADDON_HANDLE, False, xbmcgui.ListItem())
             return

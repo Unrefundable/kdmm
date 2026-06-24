@@ -19,6 +19,8 @@ import xbmcaddon
 import xbmcgui
 import xbmcvfs
 
+from user_messages import describe_exception, is_network_exception
+
 _CLIENT_ID = "X245A4XAIBGVM"
 _RD_OAUTH_BASE = "https://api.real-debrid.com/oauth/v2"
 _ADDON_ID = "plugin.video.kdmm"
@@ -127,7 +129,10 @@ def authorize():
     if "error" in fetch_result:
         exc = fetch_result["error"]
         _log(f"Failed to get device code: {exc}", xbmc.LOGERROR)
-        xbmcgui.Dialog().ok("KDMM", f"RD error: {type(exc).__name__}: {str(exc)[:200]}")
+        xbmcgui.Dialog().ok(
+            "KDMM - Real-Debrid",
+            describe_exception(exc, "Real-Debrid", "starting authorization"),
+        )
         return False
 
     data = fetch_result.get("data", {})
@@ -192,7 +197,7 @@ def _show_auth_dialog(device_code, user_code, verification_url, qr_image_path,
     the dialog at 1-second ticks so Kodi's UI stays responsive.
     """
     # Shared state between main thread and poller thread
-    result = {"status": "pending"}   # "pending" | "ok" | "error" | "timeout"
+    result = {"status": "pending", "error": None}   # "pending" | "ok" | "error" | "timeout"
     result_lock = threading.Lock()
 
     def _poll_thread():
@@ -219,6 +224,8 @@ def _show_auth_dialog(device_code, user_code, verification_url, qr_image_path,
                 )
             except Exception as exc:
                 _log(f"Poll request failed: {exc}", xbmc.LOGWARNING)
+                with result_lock:
+                    result["error"] = exc
                 continue
 
             if resp.status_code == 200:
@@ -290,7 +297,14 @@ def _show_auth_dialog(device_code, user_code, verification_url, qr_image_path,
         _log("User cancelled authorization")
         return False
     elif status == "timeout":
-        xbmcgui.Dialog().ok("KDMM", "Authorization timed out. Please try again.")
+        last_error = result.get("error")
+        if last_error:
+            xbmcgui.Dialog().ok(
+                "KDMM - Real-Debrid",
+                describe_exception(last_error, "Real-Debrid", "checking authorization"),
+            )
+        else:
+            xbmcgui.Dialog().ok("KDMM", "Authorization timed out. Please try again.")
         return False
     else:
         xbmcgui.Dialog().ok("KDMM", "Failed to get access token from Real-Debrid.")
@@ -376,6 +390,10 @@ def refresh_token():
             except Exception as notify_exc:
                 _log(f"Auth failure notification failed: {notify_exc}", xbmc.LOGWARNING)
             _write_tokens({})
+        elif is_network_exception(exc):
+            raise RuntimeError(
+                describe_exception(exc, "Real-Debrid", "refreshing authorization")
+            )
         return None
 
     new_token = data.get("access_token", "")

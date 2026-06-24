@@ -27,6 +27,8 @@ import xbmcaddon
 import xbmcgui
 import xbmcvfs
 
+from user_messages import describe_exception, is_network_exception
+
 _DMM_SALT = "debridmediamanager.com%%fe7#td00rA3vHz%VmI"
 _DMM_BASE = "https://debridmediamanager.com"
 _RD_BASE = "https://api.real-debrid.com/rest/1.0"
@@ -42,6 +44,11 @@ _RD_BLOCKED_HASH_KEY = "blocked_hash"
 _PROVIDER_RD = "realdebrid"
 _PROVIDER_AD = "alldebrid"
 _AUTH_NOTICE_SHOWN = set()
+
+
+class _NetworkFailure:
+    def __init__(self, message):
+        self.message = message
 
 _VIDEO_EXTS = (".mkv", ".mp4", ".avi", ".m4v", ".webm", ".ts")
 _NON_MAIN_VIDEO_DIRS = {
@@ -1600,7 +1607,8 @@ def _provider_short(provider):
 
 
 def _provider_auth_notice(provider, reason=None):
-    return f"{_provider_label(provider)} authorization failed"
+    label = _provider_label(provider)
+    return f"{label} authorization was rejected. Re-authorize {label} in KDMM settings."
 
 
 def _notify_provider_auth_failure(provider, reason=None):
@@ -2186,6 +2194,12 @@ def _try_resolve_one(candidate, api_token, season, episode, cancel_event,
             if rd_id:
                 _rd_delete(f"/torrents/delete/{rd_id}", api_token)
             return {_RD_BLOCKED_HASH_KEY: candidate.get("hash")}
+        if is_network_exception(exc):
+            message = describe_exception(exc, _provider_label(_PROVIDER_RD), "resolving stream")
+            _log(f"{h8} RD network failure: {message}", xbmc.LOGWARNING)
+            if rd_id:
+                _rd_delete(f"/torrents/delete/{rd_id}", api_token)
+            return _NetworkFailure(message)
         _log(f"{h8} failed: {exc}", xbmc.LOGWARNING)
         if rd_id:
             _rd_delete(f"/torrents/delete/{rd_id}", api_token)
@@ -2356,6 +2370,12 @@ def _try_resolve_one_ad(candidate, api_token, season, episode, cancel_event,
             _ad_delete_magnet(ad_id, api_token)
         return _AUTH_FAILURE
     except Exception as exc:
+        if is_network_exception(exc):
+            message = describe_exception(exc, _provider_label(_PROVIDER_AD), "resolving stream")
+            _log(f"{h8} AD network failure: {message}", xbmc.LOGWARNING)
+            if ad_id:
+                _ad_delete_magnet(ad_id, api_token)
+            return _NetworkFailure(message)
         _log(f"{h8} AD failed: {exc}", xbmc.LOGWARNING)
         if ad_id:
             _ad_delete_magnet(ad_id, api_token)
@@ -2414,6 +2434,8 @@ def _resolve_by_direct_add(candidates_info, api_token, season=None, episode=None
                     # Count auth failures; if the whole first batch fails with 401
                     # the token is bad — abort immediately and signal re-auth needed.
                     pass  # counted below after batch drains
+                elif isinstance(result, _NetworkFailure):
+                    pass  # counted below after batch drains
                 elif isinstance(result, dict) and result.get(_RD_BLOCKED_HASH_KEY):
                     if blocked_hashes is not None:
                         blocked_hashes.append(result[_RD_BLOCKED_HASH_KEY])
@@ -2444,6 +2466,11 @@ def _resolve_by_direct_add(candidates_info, api_token, season=None, episode=None
         if non_none and all(r is _AUTH_FAILURE for r in non_none):
             _log(f"All {short} calls returned auth failure – token is invalid", xbmc.LOGWARNING)
             raise PermissionError(f"{provider}_token_rejected")
+        if non_none and all(isinstance(r, _NetworkFailure) for r in non_none):
+            message = non_none[0].message
+            _log(f"All {short} calls failed due to network/service reachability: {message}",
+                 xbmc.LOGWARNING)
+            raise RuntimeError(message)
 
         if resolved:
             break
@@ -2653,11 +2680,9 @@ def fetch_all_cached_streams(catalog_type, video_id, cancel_event=None,
             season=season,
         )
     except Exception as exc:
-        _log(f"DMM hash fetch failed: {exc}", xbmc.LOGERROR)
-        xbmcgui.Dialog().notification(
-            "KDMM", "DMM lookup failed",
-            xbmcgui.NOTIFICATION_ERROR, 8000)
-        return []
+        message = describe_exception(exc, "Debrid Media Manager", "looking up streams")
+        _log(f"DMM hash fetch failed: {message} ({exc})", xbmc.LOGERROR)
+        raise RuntimeError(message)
 
     if not dmm_results:
         _log(f"No torrents in DMM database for {video_id}")
