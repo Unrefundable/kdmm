@@ -14,6 +14,8 @@ import xbmcaddon
 import xbmcgui
 import xbmcvfs
 
+from user_messages import describe_exception
+
 _AD_BASE = "https://api.alldebrid.com/v4"
 _AD_BASE_41 = "https://api.alldebrid.com/v4.1"
 _ADDON_ID = "plugin.video.kdmm"
@@ -141,7 +143,10 @@ def authorize():
     if "error" in fetch_result:
         exc = fetch_result["error"]
         _log(f"Failed to get PIN: {exc}", xbmc.LOGERROR)
-        xbmcgui.Dialog().ok("KDMM", f"AllDebrid error: {type(exc).__name__}: {str(exc)[:200]}")
+        xbmcgui.Dialog().ok(
+            "KDMM - AllDebrid",
+            describe_exception(exc, "AllDebrid", "starting authorization"),
+        )
         return False
 
     data = fetch_result.get("data", {})
@@ -157,7 +162,7 @@ def authorize():
 
 
 def _show_auth_dialog(pin, check, user_url, expires_in):
-    result = {"status": "pending"}
+    result = {"status": "pending", "error": None}
     result_lock = threading.Lock()
 
     def _poll_thread():
@@ -178,6 +183,8 @@ def _show_auth_dialog(pin, check, user_url, expires_in):
                 payload = resp.json()
             except Exception as exc:
                 _log(f"PIN poll failed: {exc}", xbmc.LOGWARNING)
+                with result_lock:
+                    result["error"] = exc
                 continue
 
             if not _api_status_ok(payload):
@@ -242,7 +249,14 @@ def _show_auth_dialog(pin, check, user_url, expires_in):
         _log("User cancelled authorization")
         return False
     if status == "timeout":
-        xbmcgui.Dialog().ok("KDMM", "AllDebrid authorization timed out. Please try again.")
+        last_error = result.get("error")
+        if last_error:
+            xbmcgui.Dialog().ok(
+                "KDMM - AllDebrid",
+                describe_exception(last_error, "AllDebrid", "checking authorization"),
+            )
+        else:
+            xbmcgui.Dialog().ok("KDMM", "AllDebrid authorization timed out. Please try again.")
         return False
     xbmcgui.Dialog().ok("KDMM", "Failed to get API key from AllDebrid.")
     return False

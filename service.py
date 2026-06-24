@@ -27,6 +27,7 @@ from next_episode import get_next_episode, play_next_episode  # noqa: E402
 from playback import decode_playback_context  # noqa: E402
 from segment_overlay import show_skip_overlay  # noqa: E402
 from settings_persistence import get_stream_cache_ttl_hours  # noqa: E402
+from user_messages import describe_playback_failure  # noqa: E402
 
 # ------------------------------------------------------------------ #
 # One-time player JSON installer
@@ -383,7 +384,10 @@ class BridgePlayer(xbmc.Player):
             self._tried_urls.add(url)
         WIN.clearProperty(PROP_PENDING_PLAYBACK)
         _log(f"Playback did not start for {media_id}; clearing failed stream", xbmc.LOGWARNING)
-        self._clear_failed_stream(media_id)
+        self._clear_failed_stream(
+            media_id,
+            "Stream did not start. KDMM cleared the cached URL; retry playback to pick another source.",
+        )
 
     def onAVStarted(self):
         media_id = WIN.getProperty(PROP_MEDIA_ID)
@@ -451,7 +455,10 @@ class BridgePlayer(xbmc.Player):
             self._tried_urls.add(self._current_url)
 
         _log(f"Playback error for {media_id}; clearing failed stream", xbmc.LOGWARNING)
-        self._clear_failed_stream(media_id)
+        self._clear_failed_stream(
+            media_id,
+            "Kodi could not open this stream. KDMM cleared it; retry playback to pick another source.",
+        )
 
     def _handle_playback_stop(self, is_ended):
         media_id = self._current_media_id
@@ -478,7 +485,10 @@ class BridgePlayer(xbmc.Player):
             self._current_media_id = None
             if self._current_url:
                 self._tried_urls.add(self._current_url)
-            self._clear_failed_stream(media_id, "Stream failed")
+            self._clear_failed_stream(
+                media_id,
+                "Stream opened but ended immediately. KDMM cleared it; retry playback to pick another source.",
+            )
         else:
             self._save_progress(is_ended=is_ended)
             if next_episode:
@@ -512,9 +522,9 @@ class BridgePlayer(xbmc.Player):
         self._playback_context = {}
         xbmcgui.Dialog().notification(
             "KDMM",
-            message,
+            describe_playback_failure(message),
             xbmcgui.NOTIFICATION_ERROR,
-            5000,
+            8000,
         )
 
     def _save_progress(self, is_ended):
