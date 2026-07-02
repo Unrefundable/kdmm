@@ -52,6 +52,7 @@ from cache import StreamCache, ProgressCache, PackBindingCache        # noqa: E4
 from dmm import (    # noqa: E402
     candidate_matches_episode_identity,
     candidate_matches_audio_preference,
+    cleanup_stream_candidate,
     fetch_all_cached_streams,
     is_av1_stream,
     is_stream_accessible,
@@ -68,7 +69,7 @@ from user_messages import describe_failure  # noqa: E402
 WIN = xbmcgui.Window(10000)
 PROP_MEDIA_ID = "kdmm.media_id"
 PROP_RESUME_TIME = "kdmm.resume_time"
-PROP_CANDIDATES = "kdmm.candidates"   # JSON list of all cached stream candidates
+PROP_CANDIDATES = "kdmm.candidates"   # JSON list of selected stream candidates
 PROP_PLAYBACK_CONTEXT = "kdmm.playback_context"
 PROP_PENDING_PLAYBACK = "kdmm.pending_playback"
 
@@ -229,6 +230,21 @@ def _episode_cache_needs_identity_refresh(cached):
         and candidate.get("episode_identity_probe") not in ("matched", "unknown")
         for candidate in candidates
     )
+
+
+def _cleanup_candidates(candidates):
+    for candidate in candidates or []:
+        cleanup_stream_candidate(candidate)
+
+
+def _provider_state_key(candidate):
+    if not isinstance(candidate, dict):
+        return None
+    provider = candidate.get("provider")
+    item_id = candidate.get("provider_item_id") or candidate.get("ad_magnet_id")
+    if not provider or not item_id:
+        return None
+    return provider, str(item_id)
 
 
 def _authorize_debrid_account():
@@ -472,9 +488,6 @@ def action_play(params):
             xbmcplugin.setResolvedUrl(ADDON_HANDLE, False, xbmcgui.ListItem())
             return
 
-        stream_cache.set(media_id, candidates)
-        _log(f"Stored {len(candidates)} candidate(s) for {media_id}: {candidates[0]['name']!r}")
-
     # ---- 3. Ensure candidates is a list ----------------------------- #
     candidates = _filter_playable_candidates(
         candidates,
@@ -483,7 +496,7 @@ def action_play(params):
         episode_title=title if catalog_type == "series" else None,
     )
 
-    # ---- 4. Store full candidate list for service.py retry ----------- #
+    # ---- 4. Store selected candidate for service.py cleanup ---------- #
     chosen_idx = 0
     for i, c in enumerate(candidates):
         if (not _candidate_needs_accessibility_check(c)
@@ -497,11 +510,20 @@ def action_play(params):
         _log("All candidates failed size check – falling back to first", xbmc.LOGWARNING)
         chosen_idx = 0
 
-    remaining = candidates[chosen_idx:]
+    stream = candidates[chosen_idx]
+    selected_state = _provider_state_key(stream)
+    unused = [
+        candidate for candidate in (candidates[:chosen_idx] + candidates[chosen_idx + 1:])
+        if _provider_state_key(candidate) != selected_state
+    ]
+    _cleanup_candidates(unused)
+
+    remaining = [stream]
+    stream_cache.set(media_id, remaining)
+    _log(f"Stored selected candidate for {media_id}: {stream['name']!r}")
     WIN.setProperty(PROP_CANDIDATES, json.dumps(remaining))
 
     # ---- 5. Play first remaining candidate -------------------------- #
-    stream = remaining[0]
     _play_stream(
         media_id=media_id,
         url=stream["url"],

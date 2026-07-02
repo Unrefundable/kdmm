@@ -1736,11 +1736,40 @@ def _ad_post(path, api_token, data=None, timeout=6, base=None):
 
 def _ad_delete_magnet(magnet_id, api_token):
     if not magnet_id:
-        return
+        return False
     try:
         _ad_post("/magnet/delete", api_token, data={"id": str(magnet_id)}, timeout=5)
+        return True
     except Exception:
-        pass
+        return False
+
+
+def cleanup_stream_candidate(candidate):
+    """
+    Release provider-owned state for a resolved stream after Kodi is done with it.
+
+    AllDebrid links depend on the uploaded magnet staying available while Kodi
+    opens the CDN URL, so resolution keeps that magnet alive. Once playback has
+    ended or failed, the service can call this to avoid leaving stale AD state
+    around between movies.
+    """
+    if not isinstance(candidate, dict):
+        return False
+    if candidate.get("provider") != _PROVIDER_AD:
+        return False
+    magnet_id = candidate.get("provider_item_id") or candidate.get("ad_magnet_id")
+    if not magnet_id:
+        return False
+    api_token = _ad_key()
+    if not api_token:
+        _log("Cannot clean up AD magnet; no AllDebrid API key", xbmc.LOGWARNING)
+        return False
+    cleaned = _ad_delete_magnet(magnet_id, api_token)
+    if cleaned:
+        _log(f"Cleaned up AD magnet {magnet_id} for {candidate.get('name', 'stream')!r}")
+    else:
+        _log(f"Could not clean up AD magnet {magnet_id}", xbmc.LOGWARNING)
+    return cleaned
 
 
 # ------------------------------------------------------------------ #
@@ -2359,6 +2388,7 @@ def _try_resolve_one_ad(candidate, api_token, season, episode, cancel_event,
                 "url_refreshed_after_probe": url_refreshed,
                 "provider": _PROVIDER_AD,
                 "provider_label": _provider_label(_PROVIDER_AD),
+                "provider_item_id": str(ad_id),
             }
         _ad_delete_magnet(ad_id, api_token)
         ad_id = None
