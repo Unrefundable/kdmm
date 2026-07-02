@@ -22,6 +22,7 @@ _USERDATA_PATH = xbmcvfs.translatePath(
 sys.path.insert(0, os.path.join(_ADDON_PATH, "lib"))
 
 from cache import StreamCache, ProgressCache, PackBindingCache   # noqa: E402
+from dmm import cleanup_stream_candidate  # noqa: E402
 from introdb_client import query_all_segments  # noqa: E402
 from next_episode import get_next_episode, play_next_episode  # noqa: E402
 from playback import decode_playback_context  # noqa: E402
@@ -346,6 +347,7 @@ class BridgePlayer(xbmc.Player):
         super().__init__()
         self._current_media_id = None
         self._current_url = None
+        self._current_candidate = None
         self._last_known_time = 0.0
         self._last_known_total = 0.0
         self._tried_urls = set()
@@ -382,6 +384,8 @@ class BridgePlayer(xbmc.Player):
         url = (pending.get("url") or "").split("|")[0]
         if url:
             self._tried_urls.add(url)
+        failed_candidate = self._candidate_for_url(url)
+        self._cleanup_candidate(failed_candidate)
         WIN.clearProperty(PROP_PENDING_PLAYBACK)
         _log(f"Playback did not start for {media_id}; clearing failed stream", xbmc.LOGWARNING)
         self._clear_failed_stream(
@@ -399,6 +403,7 @@ class BridgePlayer(xbmc.Player):
         self._last_known_total = 0.0
         self._tried_urls = set()
         self._current_url = None
+        self._current_candidate = None
         self._playback_context = decode_playback_context(
             WIN.getProperty(PROP_PLAYBACK_CONTEXT)
         )
@@ -406,6 +411,7 @@ class BridgePlayer(xbmc.Player):
             self._current_url = self.getPlayingFile().split("|")[0]
         except Exception:
             pass
+        self._current_candidate = self._candidate_for_url(self._current_url)
         WIN.clearProperty(PROP_MEDIA_ID)
         WIN.clearProperty(PROP_PENDING_PLAYBACK)
         WIN.clearProperty(PROP_NEXT_EPISODE_TRANSITION)
@@ -454,6 +460,7 @@ class BridgePlayer(xbmc.Player):
         if self._current_url:
             self._tried_urls.add(self._current_url)
 
+        self._cleanup_current_candidate(clear_stream_cache=True, media_id=media_id)
         _log(f"Playback error for {media_id}; clearing failed stream", xbmc.LOGWARNING)
         self._clear_failed_stream(
             media_id,
@@ -485,11 +492,13 @@ class BridgePlayer(xbmc.Player):
             self._current_media_id = None
             if self._current_url:
                 self._tried_urls.add(self._current_url)
+            self._cleanup_current_candidate(clear_stream_cache=False)
             self._clear_failed_stream(
                 media_id,
                 "Stream opened but ended immediately. KDMM cleared it; retry playback to pick another source.",
             )
         else:
+            self._cleanup_current_candidate(clear_stream_cache=True, media_id=media_id)
             self._save_progress(is_ended=is_ended)
             if next_episode:
                 self._open_next_episode(next_episode)
@@ -509,6 +518,53 @@ class BridgePlayer(xbmc.Player):
 
         threading.Thread(target=_open, daemon=True).start()
 
+    def _load_candidates(self):
+        candidates_json = WIN.getProperty(PROP_CANDIDATES)
+        if not candidates_json:
+            return []
+        try:
+            candidates = json.loads(candidates_json)
+        except Exception:
+            return []
+        return candidates if isinstance(candidates, list) else []
+
+    def _candidate_for_url(self, url):
+        url = (url or "").split("|")[0]
+        if not url:
+            return None
+        for candidate in self._load_candidates():
+            candidate_url = (candidate.get("url") or "").split("|")[0]
+            if candidate_url == url:
+                return candidate
+        return None
+
+    def _candidate_has_provider_state(self, candidate):
+        if not isinstance(candidate, dict):
+            return False
+        return (
+            candidate.get("provider") == "alldebrid"
+            and bool(candidate.get("provider_item_id") or candidate.get("ad_magnet_id"))
+        )
+
+    def _cleanup_candidate(self, candidate):
+        if not self._candidate_has_provider_state(candidate):
+            return
+
+        import threading
+
+        def _cleanup():
+            cleanup_stream_candidate(candidate)
+
+        threading.Thread(target=_cleanup, daemon=True).start()
+
+    def _cleanup_current_candidate(self, clear_stream_cache=False, media_id=None):
+        candidate = self._current_candidate
+        self._current_candidate = None
+        if clear_stream_cache and media_id and self._candidate_has_provider_state(candidate):
+            self._stream_cache.clear(media_id)
+        self._cleanup_candidate(candidate)
+        WIN.clearProperty(PROP_CANDIDATES)
+
     def _clear_failed_stream(self, media_id, message="Playback failed"):
         self._stream_cache.clear(media_id)
         if media_id and media_id.count(":") >= 2:
@@ -520,6 +576,7 @@ class BridgePlayer(xbmc.Player):
         WIN.clearProperty(PROP_MEDIA_ID)
         WIN.clearProperty(PROP_RESUME_TIME)
         self._playback_context = {}
+        self._current_candidate = None
         xbmcgui.Dialog().notification(
             "KDMM",
             describe_playback_failure(message),
@@ -534,6 +591,7 @@ class BridgePlayer(xbmc.Player):
         self._current_media_id = None
         WIN.clearProperty(PROP_PENDING_PLAYBACK)
         WIN.clearProperty(PROP_PLAYBACK_CONTEXT)
+        WIN.clearProperty(PROP_CANDIDATES)
         self._playback_context = {}
 
         current_time = self._last_known_time

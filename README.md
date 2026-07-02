@@ -13,8 +13,8 @@ streams.
   source type, preferred release groups, title match, and TV pack preference.
 - Filters AV1 streams with filename/title detection and optional direct metadata
   probing.
-- Hands Kodi a direct playback URL and keeps fallback candidates for automatic
-  retry when a stream fails to start.
+- Hands Kodi a direct playback URL and cleans up provider-owned stream state
+  after playback ends or fails.
 - Caches resolved candidates, resume positions, blocked Real-Debrid hashes, and
   preferred TV pack bindings.
 - Supports local resume, watched progress, and play-from-beginning behavior.
