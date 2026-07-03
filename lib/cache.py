@@ -18,6 +18,7 @@ class StreamCache:
     """Cache for resolved stream URLs so we don't re-query every play."""
 
     DEFAULT_TTL = 14 * 24 * 3600
+    PROVIDER_STATE_TTL = 20 * 60
 
     def __init__(self, userdata_path, ttl=None):
         self._path = os.path.join(userdata_path, "stream_cache.json")
@@ -38,14 +39,28 @@ class StreamCache:
         with open(self._path, "w", encoding="utf-8") as fh:
             json.dump(self._data, fh, indent=2)
 
+    def _has_provider_state(self, candidates):
+        if isinstance(candidates, dict):
+            candidates = [candidates]
+        for candidate in candidates or []:
+            if not isinstance(candidate, dict):
+                continue
+            if candidate.get("provider_item_id") or candidate.get("ad_magnet_id"):
+                return True
+        return False
+
     def get(self, media_id):
         entry = self._data.get(media_id)
         if not entry:
             return None
         age = time.time() - entry.get("timestamp", 0)
-        if age > self._ttl:
-            return None
         candidates = entry.get("candidates")
+        if age > self._ttl or (
+                self._has_provider_state(candidates)
+                and age > min(self._ttl, self.PROVIDER_STATE_TTL)):
+            self._data.pop(media_id, None)
+            self._save()
+            return None
         if not candidates:
             return None
         return candidates

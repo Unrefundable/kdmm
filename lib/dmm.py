@@ -2502,7 +2502,7 @@ def _resolve_by_direct_add(candidates_info, api_token, season=None, episode=None
                  xbmc.LOGWARNING)
             raise RuntimeError(message)
 
-        if resolved:
+        if len(resolved) >= max_resolve:
             break
 
         if enough_event.is_set():
@@ -2512,7 +2512,7 @@ def _resolve_by_direct_add(candidates_info, api_token, season=None, episode=None
         if batch_start + batch_size < len(candidates_info):
             _time.sleep(_RD_ADD_MAGNET_BATCH_PAUSE if provider == _PROVIDER_RD else 0.2)
 
-    return resolved
+    return resolved[:max_resolve]
 
 
 # ------------------------------------------------------------------ #
