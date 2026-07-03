@@ -69,7 +69,7 @@ from user_messages import describe_failure  # noqa: E402
 WIN = xbmcgui.Window(10000)
 PROP_MEDIA_ID = "kdmm.media_id"
 PROP_RESUME_TIME = "kdmm.resume_time"
-PROP_CANDIDATES = "kdmm.candidates"   # JSON list of selected stream candidates
+PROP_CANDIDATES = "kdmm.candidates"   # JSON list of playable stream candidates
 PROP_PLAYBACK_CONTEXT = "kdmm.playback_context"
 PROP_PENDING_PLAYBACK = "kdmm.pending_playback"
 
@@ -245,6 +245,22 @@ def _provider_state_key(candidate):
     if not provider or not item_id:
         return None
     return provider, str(item_id)
+
+
+def _candidate_cache_key(candidate):
+    if not isinstance(candidate, dict):
+        return None
+    provider_state = _provider_state_key(candidate)
+    if provider_state:
+        return ("provider_state",) + provider_state
+    url = (candidate.get("url") or "").split("|")[0]
+    if url:
+        return ("url", url)
+    torrent_hash = candidate.get("hash")
+    name = candidate.get("name")
+    if torrent_hash or name:
+        return ("stream", torrent_hash, name)
+    return None
 
 
 def _authorize_debrid_account():
@@ -496,7 +512,7 @@ def action_play(params):
         episode_title=title if catalog_type == "series" else None,
     )
 
-    # ---- 4. Store selected candidate for service.py cleanup ---------- #
+    # ---- 4. Store ordered candidates for service.py cleanup/fallback - #
     chosen_idx = 0
     for i, c in enumerate(candidates):
         if (not _candidate_needs_accessibility_check(c)
@@ -510,17 +526,28 @@ def action_play(params):
         _log("All candidates failed size check – falling back to first", xbmc.LOGWARNING)
         chosen_idx = 0
 
-    stream = candidates[chosen_idx]
-    selected_state = _provider_state_key(stream)
-    unused = [
-        candidate for candidate in (candidates[:chosen_idx] + candidates[chosen_idx + 1:])
-        if _provider_state_key(candidate) != selected_state
-    ]
-    _cleanup_candidates(unused)
+    if chosen_idx > 0:
+        _cleanup_candidates(candidates[:chosen_idx])
 
-    remaining = [stream]
+    stream = candidates[chosen_idx]
+    remaining = []
+    seen = set()
+    for candidate in candidates[chosen_idx:]:
+        key = _candidate_cache_key(candidate)
+        if key and key in seen:
+            continue
+        if key:
+            seen.add(key)
+        remaining.append(candidate)
+
     stream_cache.set(media_id, remaining)
-    _log(f"Stored selected candidate for {media_id}: {stream['name']!r}")
+    if len(remaining) > 1:
+        _log(
+            f"Stored {len(remaining)} candidate(s) for {media_id}; "
+            f"selected: {stream['name']!r}"
+        )
+    else:
+        _log(f"Stored selected candidate for {media_id}: {stream['name']!r}")
     WIN.setProperty(PROP_CANDIDATES, json.dumps(remaining))
 
     # ---- 5. Play first remaining candidate -------------------------- #
