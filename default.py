@@ -50,12 +50,14 @@ sys.path.insert(0, os.path.join(_ADDON_PATH, "lib"))
 
 from cache import StreamCache, ProgressCache, PackBindingCache        # noqa: E402 (after sys.path)
 from dmm import (    # noqa: E402
+    CachedStreamBlocked,
     candidate_matches_episode_identity,
     candidate_matches_audio_preference,
     cleanup_stream_candidate,
     fetch_all_cached_streams,
     is_av1_stream,
     is_stream_accessible,
+    refresh_cached_stream,
 )
 from playback import apply_playback_metadata, build_playback_context, encode_playback_context  # noqa: E402
 from ad_auth import authorize as ad_authorize, revoke as ad_revoke  # noqa: E402
@@ -69,7 +71,7 @@ from user_messages import describe_failure  # noqa: E402
 WIN = xbmcgui.Window(10000)
 PROP_MEDIA_ID = "kdmm.media_id"
 PROP_RESUME_TIME = "kdmm.resume_time"
-PROP_CANDIDATES = "kdmm.candidates"   # JSON list of playable stream candidates
+PROP_CANDIDATES = "kdmm.candidates"   # JSON list of selected stream candidates
 PROP_PLAYBACK_CONTEXT = "kdmm.playback_context"
 PROP_PENDING_PLAYBACK = "kdmm.pending_playback"
 
@@ -223,6 +225,16 @@ def _cache_needs_refresh(cached):
     return any(_candidate_has_probe_consumed_url(c) for c in candidates if isinstance(c, dict))
 
 
+def _cache_can_refresh_direct_url(cached):
+    candidates = cached if isinstance(cached, list) else [cached]
+    return any(
+        isinstance(candidate, dict)
+        and candidate.get("provider") == "alldebrid"
+        and len((candidate.get("hash") or "")) == 40
+        for candidate in candidates
+    )
+
+
 def _episode_cache_needs_identity_refresh(cached):
     candidates = cached if isinstance(cached, list) else [cached]
     return any(
@@ -245,22 +257,6 @@ def _provider_state_key(candidate):
     if not provider or not item_id:
         return None
     return provider, str(item_id)
-
-
-def _candidate_cache_key(candidate):
-    if not isinstance(candidate, dict):
-        return None
-    provider_state = _provider_state_key(candidate)
-    if provider_state:
-        return ("provider_state",) + provider_state
-    url = (candidate.get("url") or "").split("|")[0]
-    if url:
-        return ("url", url)
-    torrent_hash = candidate.get("hash")
-    name = candidate.get("name")
-    if torrent_hash or name:
-        return ("stream", torrent_hash, name)
-    return None
 
 
 def _authorize_debrid_account():
@@ -372,9 +368,15 @@ def action_play(params):
         cached = stream_cache.get(media_id)
         if cached:
             if _cache_needs_refresh(cached):
-                _log(f"Refreshing {media_id}; cached URL may have been consumed by codec probe")
-                stream_cache.clear(media_id)
-                cached = None
+                if _cache_can_refresh_direct_url(cached):
+                    _log(
+                        f"Refreshing direct URL for {media_id}; "
+                        "cached AllDebrid source identity is still usable"
+                    )
+                else:
+                    _log(f"Refreshing {media_id}; cached URL may have been consumed by codec probe")
+                    stream_cache.clear(media_id)
+                    cached = None
             elif catalog_type == "series" and _episode_cache_needs_identity_refresh(cached):
                 _log(f"Refreshing {media_id}; cached episode stream predates identity checks")
                 stream_cache.clear(media_id)
@@ -406,6 +408,49 @@ def action_play(params):
                             "KDMM", "Using cached stream",
                             xbmcgui.NOTIFICATION_INFO, 2000,
                         )
+                    if cached and candidates:
+                        try:
+                            refreshed = refresh_cached_stream(
+                                candidates[0],
+                                season=season if catalog_type == "series" else None,
+                                episode=episode if catalog_type == "series" else None,
+                                query_title=query_title,
+                                year=year,
+                                episode_title=title if catalog_type == "series" else None,
+                            )
+                            candidates = [refreshed]
+                            stream_cache.set(media_id, candidates)
+                        except CachedStreamBlocked as exc:
+                            _log(
+                                f"Cached stream for {media_id} is blocked by AllDebrid: {exc}",
+                                xbmc.LOGWARNING,
+                            )
+                            stream_cache.clear(media_id)
+                            if catalog_type == "series":
+                                pack_cache.clear(imdb, season)
+                            xbmcgui.Dialog().notification(
+                                "KDMM",
+                                "Cached AllDebrid file is blocked",
+                                xbmcgui.NOTIFICATION_ERROR, 8000)
+                            xbmcplugin.setResolvedUrl(ADDON_HANDLE, False, xbmcgui.ListItem())
+                            return
+                        except PermissionError as exc:
+                            _log(f"Could not refresh cached stream auth: {exc}", xbmc.LOGWARNING)
+                            xbmcgui.Dialog().notification(
+                                "KDMM authorization",
+                                "AllDebrid authorization failed",
+                                xbmcgui.NOTIFICATION_ERROR, 8000)
+                            xbmcplugin.setResolvedUrl(ADDON_HANDLE, False, xbmcgui.ListItem())
+                            return
+                        except Exception as exc:
+                            _log(f"Could not refresh cached stream for {media_id}: {exc}",
+                                 xbmc.LOGWARNING)
+                            xbmcgui.Dialog().notification(
+                                "KDMM playback",
+                                describe_failure(exc, "AllDebrid", "refreshing cached stream"),
+                                xbmcgui.NOTIFICATION_ERROR, 8000)
+                            xbmcplugin.setResolvedUrl(ADDON_HANDLE, False, xbmcgui.ListItem())
+                            return
 
     # ---- 2. Fetch fresh from DMM + debrid if needed ---------------- #
     if candidates is None:
@@ -512,7 +557,7 @@ def action_play(params):
         episode_title=title if catalog_type == "series" else None,
     )
 
-    # ---- 4. Store ordered candidates for service.py cleanup/fallback - #
+    # ---- 4. Store selected candidate for service.py cleanup ---------- #
     chosen_idx = 0
     for i, c in enumerate(candidates):
         if (not _candidate_needs_accessibility_check(c)
@@ -526,28 +571,13 @@ def action_play(params):
         _log("All candidates failed size check – falling back to first", xbmc.LOGWARNING)
         chosen_idx = 0
 
-    if chosen_idx > 0:
-        _cleanup_candidates(candidates[:chosen_idx])
-
     stream = candidates[chosen_idx]
-    remaining = []
-    seen = set()
-    for candidate in candidates[chosen_idx:]:
-        key = _candidate_cache_key(candidate)
-        if key and key in seen:
-            continue
-        if key:
-            seen.add(key)
-        remaining.append(candidate)
+    unused = candidates[:chosen_idx]
+    _cleanup_candidates(unused)
 
+    remaining = [stream]
     stream_cache.set(media_id, remaining)
-    if len(remaining) > 1:
-        _log(
-            f"Stored {len(remaining)} candidate(s) for {media_id}; "
-            f"selected: {stream['name']!r}"
-        )
-    else:
-        _log(f"Stored selected candidate for {media_id}: {stream['name']!r}")
+    _log(f"Stored selected candidate for {media_id}: {stream['name']!r}")
     WIN.setProperty(PROP_CANDIDATES, json.dumps(remaining))
 
     # ---- 5. Play first remaining candidate -------------------------- #
