@@ -50,6 +50,10 @@ class _NetworkFailure:
     def __init__(self, message):
         self.message = message
 
+
+class CachedStreamBlocked(RuntimeError):
+    pass
+
 _VIDEO_EXTS = (".mkv", ".mp4", ".avi", ".m4v", ".webm", ".ts")
 _NON_MAIN_VIDEO_DIRS = {
     "extras", "extra", "featurettes", "sample", "samples", "screens",
@@ -1715,6 +1719,21 @@ def _ad_raise_for_payload(payload):
     raise RuntimeError(f"{code}: {message}" if code else message)
 
 
+def _ad_error_is_blocked(error):
+    if not error:
+        return False
+    if isinstance(error, dict):
+        text = f"{error.get('code', '')} {error.get('message', '')}"
+    else:
+        text = str(error)
+    text = text.lower()
+    blocked_markers = (
+        "blocked", "copyright", "dmca", "infring", "forbidden",
+        "blacklist", "not allowed", "disabled",
+    )
+    return any(marker in text for marker in blocked_markers)
+
+
 def _ad_get(path, api_token, timeout=6):
     s = _get_session()
     r = s.get(f"{_AD_BASE}{path}", headers=_ad_headers(api_token), timeout=timeout)
@@ -1960,6 +1979,136 @@ def _pick_best_file(files, candidate, season, episode, query_title=None, year=No
             _title_sequence_rank(_video_file_path(f), candidate.get("title", "")) or (9, 99),
         ),
     )
+
+
+def _normalize_video_path_key(path):
+    return "/".join(_video_path_components(path)).casefold()
+
+
+def _pick_cached_file(files, candidate, season=None, episode=None,
+                      query_title=None, year=None):
+    source_file = candidate.get("source_file") or ""
+    name = candidate.get("name") or candidate.get("filename") or ""
+    source_key = _normalize_video_path_key(source_file)
+    name_key = _normalize_video_path_key(name)
+
+    video_files = [
+        f for f in files or []
+        if any(_video_file_path(f).lower().endswith(ext) for ext in _VIDEO_EXTS)
+    ]
+    if not video_files:
+        return None
+
+    if source_key:
+        for f in video_files:
+            if _normalize_video_path_key(_video_file_path(f)) == source_key:
+                return f
+
+    if name_key:
+        for f in video_files:
+            path = _video_file_path(f)
+            if (_normalize_video_path_key(path) == name_key
+                    or _normalize_video_path_key(_video_basename(path)) == name_key):
+                return f
+
+    return None
+
+
+def refresh_cached_stream(candidate, season=None, episode=None,
+                          query_title=None, year=None, episode_title=None):
+    """
+    Refresh a cached candidate's temporary playback URL without changing the
+    selected torrent/file identity.
+    """
+    if not isinstance(candidate, dict):
+        return candidate
+    if candidate.get("provider") != _PROVIDER_AD:
+        return candidate
+    torrent_hash = (candidate.get("hash") or "").lower()
+    if len(torrent_hash) != 40:
+        return candidate
+
+    api_token = _ad_key()
+    if not api_token:
+        raise PermissionError("alldebrid_token_missing")
+
+    h8 = torrent_hash[:8]
+    ad_id = None
+    try:
+        magnet = f"magnet:?xt=urn:btih:{torrent_hash}"
+        upload = _ad_post(
+            "/magnet/upload",
+            api_token,
+            data=[("magnets[]", magnet)],
+            timeout=10,
+        )
+        magnets = upload.get("magnets") or []
+        item = magnets[0] if magnets else {}
+        if item.get("error"):
+            error = item.get("error")
+            if _ad_error_is_blocked(error):
+                raise CachedStreamBlocked(str(error))
+            raise RuntimeError(f"AllDebrid upload error: {error}")
+        ad_id = item.get("id")
+        if not ad_id:
+            raise RuntimeError("AllDebrid upload returned no magnet id")
+        if not item.get("ready"):
+            raise RuntimeError("Cached AllDebrid source is not currently ready")
+
+        files_data = _ad_post(
+            "/magnet/files",
+            api_token,
+            data=[("id[]", str(ad_id))],
+            timeout=10,
+        )
+        magnet_files = files_data.get("magnets") or []
+        files_entry = magnet_files[0] if magnet_files else {}
+        files = _flatten_ad_files(files_entry.get("files") or [])
+        selected_file = _pick_cached_file(
+            files, candidate, season=season, episode=episode,
+            query_title=query_title, year=year,
+        )
+        if not selected_file:
+            raise RuntimeError(
+                f"Cached file is no longer present in AllDebrid magnet: "
+                f"{candidate.get('source_file') or candidate.get('name') or h8}"
+            )
+
+        link_to_use = selected_file.get("link")
+        unlocked = _ad_post("/link/unlock", api_token, data={"link": link_to_use}, timeout=10)
+        url = unlocked.get("link")
+        if not url:
+            raise RuntimeError("AllDebrid link unlock returned no playback URL")
+
+        refreshed = dict(candidate)
+        refreshed.update({
+            "url": url,
+            "headers": {},
+            "name": unlocked.get("filename") or candidate.get("name")
+                    or selected_file.get("filename") or candidate.get("title", "Stream"),
+            "source_file": _video_file_path(selected_file) or candidate.get("source_file", ""),
+            "provider": _PROVIDER_AD,
+            "provider_label": _provider_label(_PROVIDER_AD),
+            "provider_item_id": str(ad_id),
+            "url_refreshed_after_probe": True,
+        })
+        _log(f"{h8} refreshed cached AD stream URL for {refreshed.get('name', 'stream')!r}")
+        return refreshed
+
+    except CachedStreamBlocked:
+        if ad_id:
+            _ad_delete_magnet(ad_id, api_token)
+        raise
+    except PermissionError:
+        if ad_id:
+            _ad_delete_magnet(ad_id, api_token)
+        raise
+    except Exception as exc:
+        if ad_id:
+            _ad_delete_magnet(ad_id, api_token)
+        if _ad_error_is_blocked(exc):
+            raise CachedStreamBlocked(str(exc))
+        raise
 
 
 def _try_resolve_one(candidate, api_token, season, episode, cancel_event,
@@ -2502,7 +2651,7 @@ def _resolve_by_direct_add(candidates_info, api_token, season=None, episode=None
                  xbmc.LOGWARNING)
             raise RuntimeError(message)
 
-        if len(resolved) >= max_resolve:
+        if resolved:
             break
 
         if enough_event.is_set():
@@ -2512,7 +2661,7 @@ def _resolve_by_direct_add(candidates_info, api_token, season=None, episode=None
         if batch_start + batch_size < len(candidates_info):
             _time.sleep(_RD_ADD_MAGNET_BATCH_PAUSE if provider == _PROVIDER_RD else 0.2)
 
-    return resolved[:max_resolve]
+    return resolved
 
 
 # ------------------------------------------------------------------ #
