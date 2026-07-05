@@ -102,6 +102,35 @@ def _build_final_url(url, headers_dict):
     return f"{url}|{formatted}", True
 
 
+def _url_path_lower(url):
+    """Return the lowercase stream path without Kodi pipe headers or query."""
+    return (url or "").split("|", 1)[0].split("?", 1)[0].lower()
+
+
+def _mimetype_for_url_path(url_path):
+    if url_path.endswith(".ts"):
+        return "video/mp2t"
+    if url_path.endswith(".mpd"):
+        return "application/dash+xml"
+    if url_path.endswith(".m3u8"):
+        return "application/vnd.apple.mpegurl"
+    if url_path.endswith(".mkv"):
+        return "video/x-matroska"
+    if url_path.endswith((".mp4", ".m4v")):
+        return "video/mp4"
+    if url_path.endswith(".avi"):
+        return "video/x-msvideo"
+    if url_path.endswith(".webm"):
+        return "video/webm"
+    return ""
+
+
+def _should_use_ffmpegdirect(url):
+    url_path = _url_path_lower(url)
+    adaptive_exts = (".ts", ".mpd", ".m3u8")
+    return url_path.endswith(adaptive_exts)
+
+
 def _play_stream(media_id, url, headers_dict, imdb, tmdb, title, showtitle,
                  season, episode, year=None, no_resume=False):
     """
@@ -124,20 +153,17 @@ def _play_stream(media_id, url, headers_dict, imdb, tmdb, title, showtitle,
     )
     apply_playback_metadata(li, playback_context)
 
-    # Only force inputstream.ffmpegdirect for adaptive / container formats that
-    # Kodi's native HTTP player can't handle.
-    _url_path = url.split("?")[0].lower()
-    _ADAPTIVE_EXTS = (".ts", ".mpd", ".m3u8")
-    _needs_ffmpegdirect = any(_url_path.endswith(ext) for ext in _ADAPTIVE_EXTS)
-
-    if has_headers and _needs_ffmpegdirect:
+    _url_path = _url_path_lower(url)
+    if _should_use_ffmpegdirect(url):
         li.setProperty("inputstream", "inputstream.ffmpegdirect")
-        if _url_path.endswith(".ts"):
-            li.setMimeType("video/mp2t")
-        elif _url_path.endswith(".mpd"):
-            li.setMimeType("application/dash+xml")
-        elif _url_path.endswith(".m3u8"):
-            li.setMimeType("application/vnd.apple.mpegurl")
+        li.setProperty("inputstreamaddon", "inputstream.ffmpegdirect")
+        mimetype = _mimetype_for_url_path(_url_path)
+        if mimetype:
+            li.setMimeType(mimetype)
+        try:
+            li.setContentLookup(False)
+        except Exception:
+            pass
 
     # Tag the item with its IMDB number for Trakt scrobbling.
     if imdb:
