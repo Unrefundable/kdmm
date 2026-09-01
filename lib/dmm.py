@@ -29,8 +29,9 @@ import xbmcvfs
 
 from user_messages import describe_exception, is_network_exception
 
-_DMM_SALT = "debridmediamanager.com%%fe7#td00rA3vHz%VmI"
 _DMM_BASE = "https://debridmediamanager.com"
+_DMM_CHALLENGE_URL = f"{_DMM_BASE}/api/challenge"
+_DMM_CHALLENGE_REUSE_SECONDS = 120
 _RD_BASE = "https://api.real-debrid.com/rest/1.0"
 _AD_BASE = "https://api.alldebrid.com/v4"
 _AD_BASE_41 = "https://api.alldebrid.com/v4.1"
@@ -1516,6 +1517,7 @@ def _get_requests():
 
 # Module-level session — reuses TCP/SSL connections across all RD calls.
 _rd_session = None
+_dmm_challenge = None
 
 
 def _get_session():
@@ -1528,62 +1530,39 @@ def _get_session():
 
 
 # ------------------------------------------------------------------ #
-# DMM token generation  (port of src/utils/token.ts)
+# DMM availability challenge
 # ------------------------------------------------------------------ #
 
-def _dmm_hash(s):
-    """Port of DMM's custom 32-bit hash function."""
-    h1 = 0xDEADBEEF ^ len(s)
-    h2 = 0x41C6CE57 ^ len(s)
-    for ch in s:
-        c = ord(ch)
-        h1 = _imul(h1 ^ c, 0x9E3779B1) & 0xFFFFFFFF
-        h2 = _imul(h2 ^ c, 0x5F356495) & 0xFFFFFFFF
-        h1 = ((h1 << 5) | (h1 >> 27)) & 0xFFFFFFFF
-        h2 = ((h2 << 5) | (h2 >> 27)) & 0xFFFFFFFF
-
-    h1 = (h1 + _imul(h2, 0x5D588B65)) & 0xFFFFFFFF
-    h2 = (h2 + _imul(h1, 0x78A76A79)) & 0xFFFFFFFF
-    return format((h1 ^ h2) & 0xFFFFFFFF, "x")
-
-
-def _imul(a, b):
-    """Emulate JavaScript Math.imul (signed 32-bit multiply)."""
-    a &= 0xFFFFFFFF
-    b &= 0xFFFFFFFF
-    result = (a * b) & 0xFFFFFFFF
-    if result >= 0x80000000:
-        result -= 0x100000000
-    # we need unsigned for bit shifts later
-    return result & 0xFFFFFFFF
-
-
-def _combine_hashes(h1, h2):
-    """Port of DMM's combineHashes (interleave + reverse)."""
-    half = len(h1) // 2
-    fp1, sp1 = h1[:half], h1[half:]
-    fp2, sp2 = h2[:half], h2[half:]
-
-    obfuscated = ""
-    for i in range(half):
-        obfuscated += fp1[i] + fp2[i]
-    obfuscated += sp2[::-1] + sp1[::-1]
-    return obfuscated
+def _clear_dmm_challenge():
+    """Discard the cached DMM challenge after an authentication failure."""
+    global _dmm_challenge
+    _dmm_challenge = None
 
 
 def _generate_token_and_hash(api_token=None):
     """
-    Generate a (tokenWithTimestamp, combinedHash) pair accepted by DMM's API.
-    Uses the local system clock for the timestamp — a Mac is NTP-synced so
-    it matches DMM's server clock.  No RD API call needed here.
+    Obtain the server-minted (token, hash) pair required by DMM's API.
+
+    DMM no longer accepts the legacy client-side proof-of-work algorithm.
+    The challenge is valid for five minutes; reuse it for only two minutes so
+    Kodi cannot submit a token near its expiry after a slow resolver sweep.
     """
-    import random
-    token = format(random.getrandbits(32), "x")
-    timestamp = int(_time.time())
-    token_with_ts = f"{token}-{timestamp}"
-    ts_hash = _dmm_hash(token_with_ts)
-    salt_hash = _dmm_hash(f"{_DMM_SALT}-{token}")
-    return token_with_ts, _combine_hashes(ts_hash, salt_hash)
+    del api_token  # Kept in the signature for callers on older code paths.
+    global _dmm_challenge
+    now = _time.time()
+    if _dmm_challenge and now < _dmm_challenge[2]:
+        return _dmm_challenge[0], _dmm_challenge[1]
+
+    resp = _get_session().get(_DMM_CHALLENGE_URL, timeout=10)
+    resp.raise_for_status()
+    payload = resp.json()
+    token = payload.get("token") if isinstance(payload, dict) else None
+    solution = payload.get("hash") if isinstance(payload, dict) else None
+    if not isinstance(token, str) or not token or not isinstance(solution, str) or not solution:
+        raise RuntimeError("DMM returned a malformed availability challenge")
+
+    _dmm_challenge = (token, solution, now + _DMM_CHALLENGE_REUSE_SECONDS)
+    return token, solution
 
 
 # ------------------------------------------------------------------ #
@@ -1800,25 +1779,30 @@ def _fetch_dmm_hashes(imdb_id, media_type="movie", max_size=0, page=0, api_token
     Query DMM's torrent database for all known hashes for an IMDB ID.
     Returns list of dicts: [{hash, title, fileSize, files, ...}, ...]
     """
-    token_ts, solution = _generate_token_and_hash(api_token)
     endpoint = "movie" if media_type == "movie" else "tv"
-    url = (
-        f"{_DMM_BASE}/api/torrents/{endpoint}"
-        f"?imdbId={imdb_id}"
-        f"&dmmProblemKey={token_ts}"
-        f"&solution={solution}"
-        f"&onlyTrusted=false"
-        f"&maxSize={max_size}"
-        f"&page={page}"
-    )
-    # TV endpoint requires seasonNum — returns 400 without it
-    if endpoint == "tv":
-        season_num = int(season) if season else 1
-        url += f"&seasonNum={season_num}"
-
     _log(f"Querying DMM hash DB for {imdb_id} ({media_type})")
     s = _get_session()
-    resp = s.get(url, timeout=20)
+    url = f"{_DMM_BASE}/api/torrents/{endpoint}"
+    params = {
+        "imdbId": imdb_id,
+        "onlyTrusted": "false",
+        "maxSize": max_size,
+        "page": page,
+    }
+    # TV endpoint requires seasonNum — returns 400 without it.
+    if endpoint == "tv":
+        params["seasonNum"] = int(season) if season else 1
+
+    for attempt in range(2):
+        token, solution = _generate_token_and_hash(api_token)
+        params["dmmProblemKey"] = token
+        params["solution"] = solution
+        resp = s.get(url, params=params, timeout=20)
+        if resp.status_code not in (401, 403) or attempt:
+            break
+        _log("DMM rejected its availability challenge; refreshing it once", xbmc.LOGWARNING)
+        _clear_dmm_challenge()
+
     if not resp.ok:
         body = resp.text[:500] if resp.text else "<empty>"
         _log(f"DMM {endpoint} error {resp.status_code}: {body}", xbmc.LOGERROR)
