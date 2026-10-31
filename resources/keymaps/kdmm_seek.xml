@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  kdmm_seek.xml - managed by plugin.video.kdmm, do not edit by hand.
+  Copied to userdata/keymaps/ while "Remote: FF/RW seek on release" is on.
+
+  Kodi's default FF/RW is speed-ramp playback (2x, 4x, 8x), which stalls on
+  debrid streams because the stream cannot download that fast. Instead each
+  press notifies the KDMM service, which adds 10 minutes per press and seeks
+  once, about 1.5 seconds after the last press.
+-->
+<keymap>
+  <FullscreenVideo>
+    <remote>
+      <forward>NotifyAll(plugin.video.kdmm,seek_forward)</forward>
+      <reverse>NotifyAll(plugin.video.kdmm,seek_back)</reverse>
+    </remote>
+    <keyboard>
+      <fastforward>NotifyAll(plugin.video.kdmm,seek_forward)</fastforward>
+      <rewind>NotifyAll(plugin.video.kdmm,seek_back)</rewind>
+    </keyboard>
+    <appcommand>
+      <fastforward>NotifyAll(plugin.video.kdmm,seek_forward)</fastforward>
+      <rewind>NotifyAll(plugin.video.kdmm,seek_back)</rewind>
+    </appcommand>
+  </FullscreenVideo>
+</keymap>

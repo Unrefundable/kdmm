@@ -2,11 +2,12 @@ import json
 import os
 import re
 import sys
-import xml.etree.ElementTree as ET
 from urllib.parse import urlencode
 
 import xbmc
 import xbmcaddon
+
+from bingie_helper import BINGIE_HELPER_ID, add_bingie_helper_paths, addon_path
 
 TMDB_API_URL = "https://api.themoviedb.org/3"
 TMDB_API_KEY_FALLBACK = "4f13072a99739d0780f37a524c15941d"
@@ -23,65 +24,8 @@ def _extract_int(value):
         return None
 
 
-def _addon_path(addon_id):
-    try:
-        return xbmcaddon.Addon(addon_id).getAddonInfo("path")
-    except Exception:
-        return None
-
-
-def _add_bingie_helper_paths():
-    addon_path = _addon_path("plugin.video.tmdb.bingie.helper")
-    if not addon_path:
-        return None
-
-    candidate_paths = (
-        os.path.join(addon_path, "resources", "modules"),
-        os.path.join(addon_path, "resources"),
-        os.path.join(addon_path, "resources", "lib"),
-        addon_path,
-    )
-    for path in reversed(candidate_paths):
-        if path and path not in sys.path:
-            sys.path.insert(0, path)
-    _add_dependency_module_paths(addon_path)
-    return addon_path
-
-
-def _add_dependency_module_paths(addon_path, seen=None):
-    """Add the python module folders of an add-on's dependencies to sys.path.
-
-    Kodi only does this for KDMM's own dependencies, so importing the Bingie
-    helper's code (which needs script.module.bingie, infotagger, ...) fails
-    unless we mirror it here.
-    """
-    seen = set() if seen is None else seen
-    try:
-        root = ET.parse(os.path.join(addon_path, "addon.xml")).getroot()
-    except Exception:
-        return
-    for imp in root.iter("import"):
-        dep_id = imp.get("addon", "")
-        if not dep_id.startswith("script.module.") or dep_id in seen:
-            continue
-        seen.add(dep_id)
-        dep_path = _addon_path(dep_id)
-        if not dep_path:
-            continue
-        try:
-            dep_root = ET.parse(os.path.join(dep_path, "addon.xml")).getroot()
-        except Exception:
-            continue
-        for ext in dep_root.iter("extension"):
-            if ext.get("point") == "xbmc.python.module":
-                module_path = os.path.join(dep_path, ext.get("library", "lib"))
-                if module_path not in sys.path:
-                    sys.path.append(module_path)
-        _add_dependency_module_paths(dep_path, seen)
-
-
 def _import_bingie_helper_get_next_episodes():
-    if not _add_bingie_helper_paths():
+    if not add_bingie_helper_paths():
         return None
     try:
         from tmdbbingiehelper.lib.player.details import get_next_episodes
@@ -92,7 +36,7 @@ def _import_bingie_helper_get_next_episodes():
 
 
 def _import_bingie_helper_tmdb_api():
-    if not _add_bingie_helper_paths():
+    if not add_bingie_helper_paths():
         return None
     try:
         from tmdbbingiehelper.lib.api.tmdb.api import TMDb
@@ -122,11 +66,11 @@ def _get_requests():
 
 
 def _read_bingie_tmdb_api_key():
-    addon_path = _addon_path("plugin.video.tmdb.bingie.helper")
-    if not addon_path:
+    helper_path = addon_path(BINGIE_HELPER_ID)
+    if not helper_path:
         return ""
     key_file = os.path.join(
-        addon_path, "resources", "tmdbbingiehelper", "lib",
+        helper_path, "resources", "tmdbbingiehelper", "lib",
         "api", "api_keys", "tmdb.py",
     )
     try:

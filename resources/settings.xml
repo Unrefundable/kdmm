@@ -36,6 +36,12 @@
         <setting id="introdb_api_key" type="text" label="IntroDB API key (optional)" default="" option="hidden"/>
         <setting id="segment_debug_logging" type="bool" label="Verbose IntroDB/skip logging" default="false"/>
     </category>
+    <category label="Playback &amp; Remote">
+        <setting id="return_to_details" type="bool" label="Open the title's page when playback stops or ends" default="true"/>
+        <setting id="remote_keymap" type="bool" label="Remote: Back stops playback, Up/Down shows the OSD" default="true"/>
+        <setting id="seek_on_release" type="bool" label="Remote: FF/RW add 10 minutes per press, then seek once" default="true"/>
+        <setting id="tune_bingie_helper" type="bool" label="Tune TMDb Bingie Helper threads and Trakt paging for this device" default="true"/>
+    </category>
     <category label="Cache">
         <setting id="stream_cache_ttl_hours" type="number" label="Stream cache duration (hours)" default="336"/>
         <setting id="notify_cache_hit" type="bool" label="Notify on cache hit" default="false"/>

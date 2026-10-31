@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  kdmm_remote.xml - managed by plugin.video.kdmm, do not edit by hand.
+  Copied to userdata/keymaps/ while "Remote: Back stops playback" is on.
+
+  FullscreenVideo  Up/Down   OSD instead of a 10-minute skip
+  FullscreenVideo  Ch +/-    No operation
+  FullscreenVideo  Back      Stop playback; KDMM then opens the title's page
+
+  Both <remote> and <keyboard> are mapped because some HDMI-CEC adapters
+  surface remote buttons as keyboard events.
+-->
+<keymap>
+  <!-- Make remote Back, Backspace, and Escape resolve consistently. -->
+  <global>
+    <remote>
+      <back>Back</back>
+    </remote>
+    <keyboard>
+      <backspace>Back</backspace>
+      <escape>Back</escape>
+      <browser_back>Back</browser_back>
+    </keyboard>
+    <appcommand>
+      <browser_back>Back</browser_back>
+    </appcommand>
+  </global>
+  <FullscreenVideo>
+    <remote>
+      <up>OSD</up>
+      <down>OSD</down>
+      <channelplus>noop</channelplus>
+      <channelminus>noop</channelminus>
+      <back>Stop</back>
+    </remote>
+    <keyboard>
+      <up>OSD</up>
+      <down>OSD</down>
+      <pageup>noop</pageup>
+      <pagedown>noop</pagedown>
+      <backspace>Stop</backspace>
+      <escape>Stop</escape>
+      <browser_back>Stop</browser_back>
+    </keyboard>
+    <appcommand>
+      <channel_up>noop</channel_up>
+      <channel_down>noop</channel_down>
+      <browser_back>Stop</browser_back>
+    </appcommand>
+  </FullscreenVideo>
+</keymap>

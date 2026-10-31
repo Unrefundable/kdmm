@@ -1,4 +1,5 @@
-"""KDMM service: resume and IntroDB-backed skip/next overlays."""
+"""KDMM service: resume, IntroDB-backed skip/next overlays, return to the
+title page after playback, and the remote keymaps."""
 
 import json
 import os
@@ -22,10 +23,13 @@ _USERDATA_PATH = xbmcvfs.translatePath(
 sys.path.insert(0, os.path.join(_ADDON_PATH, "lib"))
 
 from cache import ProgressCache   # noqa: E402
+from details_page import open_details  # noqa: E402
+from device_tuning import apply_device_tuning  # noqa: E402
 from dmm import cleanup_stream_candidate  # noqa: E402
 from introdb_client import query_all_segments  # noqa: E402
 from next_episode import get_next_episode, play_next_episode  # noqa: E402
 from playback import decode_playback_context  # noqa: E402
+from remote import SeekAccumulator, disable_legacy_addon, install_keymaps  # noqa: E402
 from segment_overlay import show_skip_overlay  # noqa: E402
 from settings_persistence import get_stream_cache_ttl_hours  # noqa: E402
 from user_messages import describe_playback_failure  # noqa: E402
@@ -94,6 +98,7 @@ PLAYBACK_START_TIMEOUT_SECONDS = 30
 SEGMENT_END_MARGIN_SECONDS = 0.25
 NEXT_EPISODE_FALLBACK_SECONDS = 45
 POST_CREDITS_SCENE_MIN_SECONDS = 20
+RETURN_TO_DETAILS_WAIT_SECONDS = 5
 
 
 def _log(msg, level=xbmc.LOGINFO):
@@ -353,6 +358,7 @@ class BridgePlayer(xbmc.Player):
         self._tried_urls = set()
         self._progress_cache = ProgressCache(_USERDATA_PATH)
         self._playback_context = {}
+        self._was_fullscreen = False
 
     def tick(self):
         if self._current_media_id and self.isPlaying():
@@ -365,6 +371,7 @@ class BridgePlayer(xbmc.Player):
                     self._last_known_total = total
             except Exception:
                 pass
+            self._was_fullscreen = xbmc.getCondVisibility("Window.IsActive(fullscreenvideo)")
         self._check_pending_playback_start()
 
     def _check_pending_playback_start(self):
@@ -481,6 +488,8 @@ class BridgePlayer(xbmc.Player):
 
         playback_context = dict(self._playback_context or {})
         total_time = self._last_known_total
+        was_fullscreen = self._was_fullscreen
+        self._was_fullscreen = False
         next_episode = None
         should_auto_next = (
             is_ended
@@ -510,6 +519,43 @@ class BridgePlayer(xbmc.Player):
             self._save_progress(is_ended=is_ended)
             if next_episode:
                 self._open_next_episode(next_episode)
+            elif was_fullscreen and _setting_bool("return_to_details", True):
+                self._return_to_details(playback_context)
+
+    def _return_to_details(self, context):
+        import threading
+
+        def _open():
+            if self._wait_for_menu():
+                open_details(context)
+
+        threading.Thread(target=_open, daemon=True).start()
+
+    def _wait_for_menu(self):
+        """Wait for Kodi to leave fullscreen video.
+
+        Returns False when something else started playing or a KDMM play
+        request is in flight, so the title page never covers new playback.
+        """
+        monitor = xbmc.Monitor()
+        deadline = time.time() + RETURN_TO_DETAILS_WAIT_SECONDS
+        while time.time() < deadline:
+            if (
+                self.isPlayingVideo()
+                or WIN.getProperty(PROP_NEXT_EPISODE_TRANSITION)
+                or WIN.getProperty(PROP_PENDING_PLAYBACK)
+                or WIN.getProperty(PROP_MEDIA_ID)
+            ):
+                return False
+            if not xbmc.getCondVisibility(
+                "Window.IsActive(fullscreenvideo) | Window.IsActive(busydialog) "
+                "| Window.IsActive(busydialognocancel)"
+            ):
+                return True
+            if monitor.waitForAbort(0.1):
+                return False
+        _log("Still in fullscreen video; not opening the title page", xbmc.LOGWARNING)
+        return False
 
     def _open_next_episode(self, next_episode):
         import threading
@@ -644,6 +690,22 @@ class BridgeMonitor(xbmc.Monitor):
         super().__init__()
         self.player = BridgePlayer()
         self.segment_controller = SegmentController()
+        self.seek = SeekAccumulator()
+
+    def onNotification(self, sender, method, data):  # noqa: N802
+        # Sent by NotifyAll(plugin.video.kdmm,<action>) in kdmm_seek.xml.
+        if sender == _ADDON_ID and method.startswith("Other."):
+            self.seek.press(method[len("Other."):])
+
+    def onSettingsChanged(self):  # noqa: N802
+        self._install_keymaps()
+
+    def _install_keymaps(self):
+        install_keymaps(
+            _ADDON_PATH,
+            remote_enabled=_setting_bool("remote_keymap", True),
+            seek_enabled=_setting_bool("seek_on_release", True),
+        )
 
     def run(self):
         _log("Service started")
@@ -652,9 +714,14 @@ class BridgeMonitor(xbmc.Monitor):
         except Exception as exc:
             _log(f"_install_player_json failed: {exc}", xbmc.LOGWARNING)
         get_stream_cache_ttl_hours(_USERDATA_PATH)
+        disable_legacy_addon()
+        self._install_keymaps()
+        if _setting_bool("tune_bingie_helper", True):
+            apply_device_tuning()
         while not self.abortRequested():
             self.player.tick()
             self.segment_controller.tick(self.player, self)
+            self.seek.tick(self.player)
             self.waitForAbort(0.5)
         _log("Service stopped")
 

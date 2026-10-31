@@ -21,6 +21,11 @@ streams.
 - Adds IntroDB.app and TheIntroDB-backed skip buttons for intro, recap, credits,
   and preview segments.
 - Adds manual and automatic next-episode playback for TV episodes.
+- Opens the movie's or show's page when playback stops or ends, built
+  directly by TMDb Bingie Helper so it is always the title that was playing.
+- Installs remote keymaps: Back stops playback, Up/Down shows the OSD, and
+  FF/RW add 10 minutes per press then seek once. These replace the
+  `service.kodi.lg` add-on, which KDMM disables on start.
 
 ## Install
 
@@ -44,4 +49,4 @@ add-on browser.
 
 ## Current Release
 
-The current published add-on version is `2.6.30`.
+The current published add-on version is `2.7.0`.
