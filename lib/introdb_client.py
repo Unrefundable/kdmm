@@ -12,7 +12,7 @@ except ImportError:
 
 
 ADDON = xbmcaddon.Addon()
-THEINTRODB_API_BASE = "https://api.theintrodb.org/v2"
+THEINTRODB_API_BASE = "https://api.theintrodb.org/v4"
 INTRODB_API_BASE = "https://api.introdb.app"
 MIN_REQUEST_GAP = 0.4
 SEGMENT_TYPES = ("intro", "recap", "credits", "preview")
@@ -117,24 +117,24 @@ def _build_theintrodb_urls(tmdb_id, imdb_id, season, episode, is_movie):
     if tmdb_id and _valid_tmdb(tmdb_id):
         tid = str(tmdb_id).strip()
         if is_movie:
-            urls.append((f"{THEINTRODB_API_BASE}/media?tmdb_id={tid}", "theintrodb:tmdb"))
+            urls.append((f"{THEINTRODB_API_BASE}/media?tmdb_id={tid}&details=true", "theintrodb:tmdb"))
         else:
             season_num, episode_num = _episode_nums(season, episode)
             if season_num and episode_num:
                 urls.append((
-                    f"{THEINTRODB_API_BASE}/media?tmdb_id={tid}&season={season_num}&episode={episode_num}",
+                    f"{THEINTRODB_API_BASE}/media?tmdb_id={tid}&season={season_num}&episode={episode_num}&details=true",
                     "theintrodb:tmdb",
                 ))
 
     imdb = _normalize_imdb(imdb_id)
     if imdb:
         if is_movie:
-            urls.append((f"{THEINTRODB_API_BASE}/media?imdb_id={imdb}", "theintrodb:imdb"))
+            urls.append((f"{THEINTRODB_API_BASE}/media?imdb_id={imdb}&details=true", "theintrodb:imdb"))
         else:
             season_num, episode_num = _episode_nums(season, episode)
             if season_num and episode_num:
                 urls.append((
-                    f"{THEINTRODB_API_BASE}/media?imdb_id={imdb}&season={season_num}&episode={episode_num}",
+                    f"{THEINTRODB_API_BASE}/media?imdb_id={imdb}&season={season_num}&episode={episode_num}&details=true",
                     "theintrodb:imdb",
                 ))
     return urls
