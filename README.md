@@ -1,13 +1,14 @@
 # KDMM
 
 KDMM (Kodi Debrid Media Manager) is a Kodi video add-on for playing titles from
-TMDb Bingie Helper through Debrid Media Manager search results and cached debrid
-streams.
+TMDb Bingie Helper through cached debrid streams.
 
 ## What It Does
 
 - Receives movie and episode play requests from TMDb Bingie Helper.
-- Queries Debrid Media Manager for matching torrent hashes.
+- Looks up matching torrent hashes through Torrentio (free, no key). With an
+  optional Debrid Media Manager sponsor API key it also queries DMM and merges
+  the results. DMM's open endpoints refuse tools since November 2026.
 - Resolves cached streams through Real-Debrid and/or AllDebrid.
 - Sorts candidates by quality preferences, including resolution, HDR format,
   source type, preferred release groups, title match, and TV pack preference.

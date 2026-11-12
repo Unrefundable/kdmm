@@ -1,13 +1,15 @@
 """
 KDMM – lib/dmm.py
-Debrid Media Manager torrent lookup + debrid stream resolver.
+Torrent hash lookup + debrid stream resolver.
 
 Flow:
-  1.  Generate a DMM proof-of-work token (port of their JS generateTokenAndHash).
-  2.  GET  debridmediamanager.com/api/torrents/movie (or tv)
-      → returns every known torrent hash for the IMDB ID.
-  3.  Sort candidates by preferred release groups + file size.
-  4.  For each candidate, check debrid cache via direct-add:
+  1.  Look up every known torrent hash for the IMDB ID from
+        - Torrentio's public stream API (always; free, no key), and
+        - Debrid Media Manager's sponsor API, when a DMM API key is set.
+      DMM's open /api/torrents endpoints answer HTTP 403 to tools since
+      November 2026, so KDMM no longer calls them.
+  2.  Sort candidates by preferred release groups + file size.
+  3.  For each candidate, check debrid cache via direct-add:
         POST /torrents/addMagnet → GET /torrents/info →
         POST /torrents/selectFiles → check status == 'downloaded' →
         POST /unrestrict/link → direct CDN URL.
@@ -30,8 +32,12 @@ import xbmcvfs
 from user_messages import describe_exception, is_network_exception
 
 _DMM_BASE = "https://debridmediamanager.com"
-_DMM_CHALLENGE_URL = f"{_DMM_BASE}/api/challenge"
-_DMM_CHALLENGE_REUSE_SECONDS = 120
+_DMM_SEARCH_URL = f"{_DMM_BASE}/api/zurg/search-torrents"
+_DMM_KEY_SETTING = "dmm_api_key"
+_TORRENTIO_BASE = "https://torrentio.strem.fun"
+_TORRENTIO_SIZE_RE = re.compile(r"💾\s*([\d.,]+)\s*(TB|GB|MB|KB)", re.IGNORECASE)
+_SIZE_TO_MB = {"TB": 1024 * 1024, "GB": 1024, "MB": 1, "KB": 1 / 1024}
+_HASH_RE = re.compile(r"[0-9a-f]{40}")
 _RD_BASE = "https://api.real-debrid.com/rest/1.0"
 _AD_BASE = "https://api.alldebrid.com/v4"
 _AD_BASE_41 = "https://api.alldebrid.com/v4.1"
@@ -1517,7 +1523,6 @@ def _get_requests():
 
 # Module-level session — reuses TCP/SSL connections across all RD calls.
 _rd_session = None
-_dmm_challenge = None
 
 
 def _get_session():
@@ -1527,42 +1532,6 @@ def _get_session():
         requests = _get_requests()
         _rd_session = requests.Session()
     return _rd_session
-
-
-# ------------------------------------------------------------------ #
-# DMM availability challenge
-# ------------------------------------------------------------------ #
-
-def _clear_dmm_challenge():
-    """Discard the cached DMM challenge after an authentication failure."""
-    global _dmm_challenge
-    _dmm_challenge = None
-
-
-def _generate_token_and_hash(api_token=None):
-    """
-    Obtain the server-minted (token, hash) pair required by DMM's API.
-
-    DMM no longer accepts the legacy client-side proof-of-work algorithm.
-    The challenge is valid for five minutes; reuse it for only two minutes so
-    Kodi cannot submit a token near its expiry after a slow resolver sweep.
-    """
-    del api_token  # Kept in the signature for callers on older code paths.
-    global _dmm_challenge
-    now = _time.time()
-    if _dmm_challenge and now < _dmm_challenge[2]:
-        return _dmm_challenge[0], _dmm_challenge[1]
-
-    resp = _get_session().get(_DMM_CHALLENGE_URL, timeout=10)
-    resp.raise_for_status()
-    payload = resp.json()
-    token = payload.get("token") if isinstance(payload, dict) else None
-    solution = payload.get("hash") if isinstance(payload, dict) else None
-    if not isinstance(token, str) or not token or not isinstance(solution, str) or not solution:
-        raise RuntimeError("DMM returned a malformed availability challenge")
-
-    _dmm_challenge = (token, solution, now + _DMM_CHALLENGE_REUSE_SECONDS)
-    return token, solution
 
 
 # ------------------------------------------------------------------ #
@@ -1771,46 +1740,143 @@ def cleanup_stream_candidate(candidate):
 
 
 # ------------------------------------------------------------------ #
-# DMM hash database query
+# Torrent hash lookup (Torrentio + optional DMM sponsor API)
 # ------------------------------------------------------------------ #
 
-def _fetch_dmm_hashes(imdb_id, media_type="movie", max_size=0, page=0, api_token=None, season=None):
-    """
-    Query DMM's torrent database for all known hashes for an IMDB ID.
-    Returns list of dicts: [{hash, title, fileSize, files, ...}, ...]
-    """
-    endpoint = "movie" if media_type == "movie" else "tv"
-    _log(f"Querying DMM hash DB for {imdb_id} ({media_type})")
-    s = _get_session()
-    url = f"{_DMM_BASE}/api/torrents/{endpoint}"
-    params = {
-        "imdbId": imdb_id,
-        "onlyTrusted": "false",
-        "maxSize": max_size,
-        "page": page,
-    }
-    # TV endpoint requires seasonNum — returns 400 without it.
-    if endpoint == "tv":
-        params["seasonNum"] = int(season) if season else 1
+class HashSourceError(RuntimeError):
+    """Every torrent source failed. The message is ready to show the user."""
 
-    for attempt in range(2):
-        token, solution = _generate_token_and_hash(api_token)
-        params["dmmProblemKey"] = token
-        params["solution"] = solution
-        resp = s.get(url, params=params, timeout=20)
-        if resp.status_code not in (401, 403) or attempt:
-            break
-        _log("DMM rejected its availability challenge; refreshing it once", xbmc.LOGWARNING)
-        _clear_dmm_challenge()
 
-    if not resp.ok:
-        body = resp.text[:500] if resp.text else "<empty>"
-        _log(f"DMM {endpoint} error {resp.status_code}: {body}", xbmc.LOGERROR)
+def _user_agent():
+    # Torrentio refuses the default "python-requests/x" agent; name this client.
+    try:
+        version = xbmcaddon.Addon().getAddonInfo("version") or "dev"
+    except Exception:
+        version = "dev"
+    return f"KDMM-Kodi/{version}"
+
+
+def _valid_hash(value):
+    value = str(value or "").strip().lower()
+    return value if _HASH_RE.fullmatch(value) else ""
+
+
+def _fetch_dmm_hashes(imdb_id, media_type="movie", max_size=0, page=0, api_token=None,
+                      season=None, episode=None):
+    """
+    Look up all known torrent hashes for an IMDB ID.
+
+    Sources: DMM's sponsor API (only when the optional dmm_api_key setting is
+    set) and Torrentio (always). Results are merged and de-duplicated by hash,
+    DMM first. Each result is {hash, title, fileSize (MB), files?}.
+    Raises HashSourceError, naming the failing source, when every source fails.
+    """
+    del page, api_token  # Kept for signature compatibility.
+    sources = []
+    dmm_key = _setting_text(_DMM_KEY_SETTING).strip()
+    if dmm_key:
+        sources.append(("Debrid Media Manager",
+                        lambda: _fetch_dmm_sponsor(imdb_id, media_type, season, max_size, dmm_key)))
+    sources.append(("Torrentio", lambda: _fetch_torrentio(imdb_id, media_type, season, episode)))
+
+    merged, seen, failures = [], set(), []
+    for name, fetch in sources:
+        try:
+            results = fetch()
+        except Exception as exc:
+            _log(f"{name} lookup failed for {imdb_id}: {exc}", xbmc.LOGWARNING)
+            failures.append((name, exc))
+            continue
+        added = 0
+        for result in results:
+            torrent_hash = result["hash"]
+            if torrent_hash not in seen:
+                seen.add(torrent_hash)
+                merged.append(result)
+                added += 1
+        _log(f"{name} returned {len(results)} torrent(s) for {imdb_id} ({added} new)")
+
+    if not merged and len(failures) == len(sources):
+        name, exc = failures[-1]
+        raise HashSourceError(describe_exception(exc, name, "looking up streams"))
+    return merged
+
+
+def _fetch_dmm_sponsor(imdb_id, media_type, season, max_size, api_key):
+    body = {"imdbId": imdb_id, "mediaType": "movie" if media_type == "movie" else "tv",
+            "quality": "best", "limit": 100}
+    if max_size:
+        body["maxSize"] = max_size
+    resp = _get_session().post(
+        _DMM_SEARCH_URL, json=body,
+        headers={"x-api-key": api_key, "User-Agent": _user_agent()}, timeout=20)
+    if resp.status_code == 401:
+        _log("DMM rejected the API key (missing, revoked or sponsorship lapsed); "
+             "using Torrentio only", xbmc.LOGWARNING)
     resp.raise_for_status()
-    data = resp.json()
-    results = data.get("results") or []
-    _log(f"DMM returned {len(results)} torrent(s) for {imdb_id}")
+    data = resp.json() or {}
+    if media_type == "movie":
+        releases = data.get("results") or []
+    else:
+        seasons = data.get("seasons") or {}
+        releases = seasons.get(str(int(season or 1))) or []
+    results = []
+    for release in releases:
+        if not isinstance(release, dict):
+            continue
+        torrent_hash = _valid_hash(release.get("hash"))
+        if torrent_hash and release.get("title"):
+            results.append({"hash": torrent_hash, "title": release["title"],
+                            "fileSize": release.get("fileSize") or 0})
     return results
+
+
+def _fetch_torrentio(imdb_id, media_type, season, episode):
+    if media_type == "movie":
+        url = f"{_TORRENTIO_BASE}/stream/movie/{imdb_id}.json"
+    else:
+        url = (f"{_TORRENTIO_BASE}/stream/series/"
+               f"{imdb_id}:{int(season or 1)}:{int(episode or 1)}.json")
+    resp = _get_session().get(url, headers={"User-Agent": _user_agent()}, timeout=20)
+    resp.raise_for_status()
+    streams = (resp.json() or {}).get("streams") or []
+    results = []
+    for stream in streams:
+        result = _parse_torrentio_stream(stream)
+        if result:
+            results.append(result)
+    return results
+
+
+def _parse_torrentio_stream(stream):
+    """Turn one Torrentio stream entry into a {hash, title, fileSize, files} result."""
+    if not isinstance(stream, dict):
+        return None
+    torrent_hash = _valid_hash(stream.get("infoHash"))
+    if not torrent_hash:
+        return None
+    raw_title = str(stream.get("title") or "")
+    lines = [line.strip() for line in raw_title.splitlines()]
+    # Line 1 is the torrent name; behaviorHints.filename is the file Torrentio
+    # matched to the request (for a season pack, the requested episode).
+    filename = str((stream.get("behaviorHints") or {}).get("filename") or "").strip()
+    title = (lines[0] if lines else "") or filename
+    if not title:
+        return None
+    size_mb = 0
+    match = _TORRENTIO_SIZE_RE.search(raw_title)
+    if match:
+        try:
+            size_mb = round(float(match.group(1).replace(",", ""))
+                            * _SIZE_TO_MB[match.group(2).upper()])
+        except ValueError:
+            size_mb = 0
+    result = {"hash": torrent_hash, "title": title, "fileSize": size_mb}
+    if filename:
+        # Lets _filter_tv_results see that a pack holds the episode, as DMM's
+        # file lists did. Only this one file is known, not the whole pack.
+        result["files"] = [{"path": filename, "bytes": size_mb * 1024 * 1024}]
+    return result
 
 
 # ------------------------------------------------------------------ #
@@ -2750,7 +2816,8 @@ def fetch_all_cached_streams(catalog_type, video_id, cancel_event=None,
                              query_title=None, year=None, userdata_path=None,
                              ignore_pack_binding=False, episode_title=None):
     """
-    Main entry point.  Queries DMM's hash database, then resolves cached
+    Main entry point.  Looks up torrent hashes (Torrentio, plus DMM's
+    sponsor API when a key is set), then resolves cached
     streams via configured debrid providers.  Returns a sorted list of
     {"url", "headers", "name"} candidates.
 
@@ -2834,21 +2901,25 @@ def fetch_all_cached_streams(catalog_type, video_id, cancel_event=None,
                      xbmc.LOGWARNING)
                 pack_cache.clear(imdb_id, season)
 
-    # 1. Get all hashes from DMM
+    # 1. Get all hashes (Torrentio, plus DMM's sponsor API with a key)
     try:
         dmm_results = _fetch_dmm_hashes(
             imdb_id,
             media_type="movie" if catalog_type == "movie" else "tv",
             api_token=api_token,
             season=season,
+            episode=episode,
         )
+    except HashSourceError as exc:
+        _log(f"Torrent hash lookup failed: {exc}", xbmc.LOGERROR)
+        raise RuntimeError(str(exc))
     except Exception as exc:
-        message = describe_exception(exc, "Debrid Media Manager", "looking up streams")
-        _log(f"DMM hash fetch failed: {message} ({exc})", xbmc.LOGERROR)
+        message = describe_exception(exc, "the torrent lookup", "looking up streams")
+        _log(f"Torrent hash lookup failed: {message} ({exc})", xbmc.LOGERROR)
         raise RuntimeError(message)
 
     if not dmm_results:
-        _log(f"No torrents in DMM database for {video_id}")
+        _log(f"No torrents found for {video_id}")
         xbmcgui.Dialog().notification(
             "KDMM", "No torrents found",
             xbmcgui.NOTIFICATION_WARNING, 5000)
@@ -2880,7 +2951,7 @@ def fetch_all_cached_streams(catalog_type, video_id, cancel_event=None,
             hash_map[h] = r
 
     if not hash_map:
-        _log("No valid hashes from DMM results")
+        _log("No valid hashes in torrent lookup results")
         xbmcgui.Dialog().notification(
             "KDMM", "No playable streams",
             xbmcgui.NOTIFICATION_WARNING, 5000)
@@ -2940,7 +3011,7 @@ def fetch_all_cached_streams(catalog_type, video_id, cancel_event=None,
         )
 
     provider_names = ", ".join(_provider_short(a["provider"]) for a in debrid_accounts)
-    _log(f"DMM returned {len(hash_map)} hashes, checking {len(candidates)} candidate(s) on {provider_names}")
+    _log(f"Lookup returned {len(hash_map)} hashes, checking {len(candidates)} candidate(s) on {provider_names}")
 
     resolved = []
     page_size = 20

@@ -10,8 +10,8 @@ correctly in service.py.
 
 Flow:
   1. Parse media ID from URL params (IMDB ID + optional season/episode).
-  2. Look up a cached stream URL.  On cache miss, query DMM's torrent
-     database, check RD availability, resolve best, and save to cache.
+  2. Look up a cached stream URL.  On cache miss, look up torrent hashes
+     (Torrentio, plus DMM with a sponsor key), check debrid availability, resolve best, and save to cache.
   3. Read locally-stored resume position (populated by service.py).
   4. Set window properties so the background service can apply the resume seek
      after A/V playback has actually started (onAVStarted).
@@ -478,9 +478,9 @@ def action_play(params):
                             xbmcplugin.setResolvedUrl(ADDON_HANDLE, False, xbmcgui.ListItem())
                             return
 
-    # ---- 2. Fetch fresh from DMM + debrid if needed ---------------- #
+    # ---- 2. Fetch fresh from torrent lookup + debrid if needed ------ #
     if candidates is None:
-        _log(f"Cache miss – querying DMM + debrid for {media_id}")
+        _log(f"Cache miss – looking up torrents + debrid for {media_id}")
         if force_refresh and catalog_type == "series":
             pack_cache.clear(imdb, season)
 

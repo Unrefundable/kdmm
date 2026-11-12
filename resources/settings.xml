@@ -8,6 +8,7 @@
         <setting id="ad_api_key" type="text" label="AllDebrid API Key (from alldebrid.com/apikeys)" default="" option="hidden"/>
         <setting id="authorize_ad" type="action" label="Authorize AllDebrid via PIN" action="RunPlugin(plugin://plugin.video.kdmm/?action=authorize_ad)"/>
         <setting id="revoke_ad" type="action" label="Revoke AllDebrid Authorization" action="RunPlugin(plugin://plugin.video.kdmm/?action=revoke_ad)"/>
+        <setting id="dmm_api_key" type="text" label="DMM API key (optional, DMM sponsors only; Torrentio is used either way)" default="" option="hidden"/>
         <setting id="rd_client_id" type="text" label="" visible="false" default=""/>
         <setting id="rd_client_secret" type="text" label="" visible="false" default=""/>
         <setting id="rd_access_token" type="text" label="" visible="false" default=""/>
