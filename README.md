@@ -63,15 +63,6 @@ It also covers what happens around playback: resume and watched progress, skip b
 - **Block a bad source.** If a stream is laggy or broken, block the last played source and the next play picks a different one.
 - **Manage both lists.** Clear individual cached streams or all of them, and unblock individual sources or all of them.
 
-### Remote control
-
-KDMM installs its own keymaps. They replace the `service.kodi.lg` add-on, which KDMM disables on start.
-
-| Button | Action |
-|---|---|
-| <kbd>Back</kbd> | Stop playback |
-| <kbd>Up</kbd> / <kbd>Down</kbd> | Show the OSD |
-| <kbd>FF</kbd> / <kbd>RW</kbd> | Add 10 minutes per press, then seek once |
 
 ## Installation
 
