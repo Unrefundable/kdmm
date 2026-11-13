@@ -2842,12 +2842,18 @@ def fetch_all_cached_streams(catalog_type, video_id, cancel_event=None,
     strict_matching, tv_pack_preference = _get_matching_preferences()
     pack_cache = None
     blocked_cache = None
+    user_blocked = None
     if userdata_path:
         try:
             from cache import BlockedHashCache
             blocked_cache = BlockedHashCache(userdata_path)
         except Exception as exc:
             _log(f"Blocked hash cache unavailable: {exc}", xbmc.LOGWARNING)
+        try:
+            from cache import UserBlockedSourceCache
+            user_blocked = UserBlockedSourceCache(userdata_path)
+        except Exception as exc:
+            _log(f"User-blocked source list unavailable: {exc}", xbmc.LOGWARNING)
 
     if catalog_type != "movie" and userdata_path:
         try:
@@ -2864,6 +2870,11 @@ def fetch_all_cached_streams(catalog_type, video_id, cancel_event=None,
                      f"{binding.get('title')!r}", xbmc.LOGWARNING)
                 pack_cache.clear(imdb_id, season)
                 binding = None
+        if binding and user_blocked and user_blocked.is_blocked(binding.get("hash")):
+            _log(f"Clearing user-blocked bound pack for {imdb_id} S{int(season):02d}: "
+                 f"{binding.get('title')!r}", xbmc.LOGWARNING)
+            pack_cache.clear(imdb_id, season)
+            binding = None
         if binding:
             bound_candidate = {
                 "hash": (binding.get("hash") or "").lower(),
@@ -2935,6 +2946,16 @@ def fetch_all_cached_streams(catalog_type, video_id, cancel_event=None,
         )
 
     dmm_results = _filter_av1_results(dmm_results)
+
+    if user_blocked and dmm_results:
+        before = len(dmm_results)
+        dmm_results = [
+            r for r in dmm_results
+            if not user_blocked.is_blocked(r.get("hash"))
+        ]
+        skipped = before - len(dmm_results)
+        if skipped:
+            _log(f"Skipped {skipped} source(s) blocked by the user")
 
     if not dmm_results:
         xbmcgui.Dialog().notification(

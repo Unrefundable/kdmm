@@ -48,7 +48,13 @@ ADDON_HANDLE = int(sys.argv[1]) if len(sys.argv) > 1 else -1
 NO_RESUME = len(sys.argv) > 3 and "resume:false" in sys.argv[3].lower()
 sys.path.insert(0, os.path.join(_ADDON_PATH, "lib"))
 
-from cache import StreamCache, ProgressCache, PackBindingCache        # noqa: E402 (after sys.path)
+from cache import (  # noqa: E402 (after sys.path)
+    LastPlayedSource,
+    PackBindingCache,
+    ProgressCache,
+    StreamCache,
+    UserBlockedSourceCache,
+)
 from dmm import (    # noqa: E402
     CachedStreamBlocked,
     candidate_matches_episode_identity,
@@ -270,6 +276,26 @@ def _episode_cache_needs_identity_refresh(cached):
     )
 
 
+def _cache_is_user_blocked(cached):
+    candidates = cached if isinstance(cached, list) else [cached]
+    blocked = UserBlockedSourceCache(_USERDATA_PATH)
+    return any(
+        isinstance(candidate, dict) and blocked.is_blocked(candidate.get("hash"))
+        for candidate in candidates
+    )
+
+
+def _playback_label(title, showtitle, season, episode, year):
+    if showtitle and season and episode:
+        try:
+            return f"{showtitle} S{int(season):02d}E{int(episode):02d}"
+        except ValueError:
+            return showtitle
+    if title and year:
+        return f"{title} ({year})"
+    return title or showtitle
+
+
 def _cleanup_candidates(candidates):
     for candidate in candidates or []:
         cleanup_stream_candidate(candidate)
@@ -392,6 +418,10 @@ def action_play(params):
     candidates = None
     if not force_refresh:
         cached = stream_cache.get(media_id)
+        if cached and _cache_is_user_blocked(cached):
+            _log(f"Refreshing {media_id}; cached source was blocked by the user")
+            stream_cache.clear(media_id)
+            cached = None
         if cached:
             if _cache_needs_refresh(cached):
                 if _cache_can_refresh_direct_url(cached):
@@ -602,8 +632,15 @@ def action_play(params):
     _cleanup_candidates(unused)
 
     remaining = [stream]
-    stream_cache.set(media_id, remaining)
+    playback_label = _playback_label(title, showtitle, season, episode, year)
+    stream_cache.set(media_id, remaining, label=playback_label)
     _log(f"Stored selected candidate for {media_id}: {stream['name']!r}")
+    try:
+        LastPlayedSource(_USERDATA_PATH).set(
+            media_id, stream, label=playback_label,
+        )
+    except Exception as exc:
+        _log(f"Could not record the last played source: {exc}", xbmc.LOGWARNING)
     WIN.setProperty(PROP_CANDIDATES, json.dumps(remaining))
 
     # ---- 5. Play first remaining candidate -------------------------- #
@@ -650,6 +687,143 @@ def action_clear_cache(params):
     )
 
 
+def action_block_last_source(params):
+    """Block the source behind the last play so the next play picks another."""
+    last_played = LastPlayedSource(_USERDATA_PATH)
+    last = last_played.get()
+    if not last:
+        xbmcgui.Dialog().ok(
+            "KDMM",
+            "There is no last played source to block. Play something first.",
+        )
+        return
+
+    torrent_hash = last["hash"]
+    blocked = UserBlockedSourceCache(_USERDATA_PATH)
+    release = last.get("release") or last.get("file") or torrent_hash[:8]
+    if blocked.is_blocked(torrent_hash):
+        xbmcgui.Dialog().ok("KDMM", f"This source is already blocked:[CR]{release}")
+        return
+
+    lines = []
+    if last.get("label"):
+        lines.append(f"Last played: {last['label']}")
+    lines.append(f"Source: {release}")
+    lines.append("KDMM will pick a different source the next time you play it.")
+    if not xbmcgui.Dialog().yesno(
+        "KDMM - Block last played source",
+        "[CR]".join(lines),
+        yeslabel="Block",
+        nolabel="Cancel",
+    ):
+        return
+
+    blocked.block(
+        torrent_hash, name=release,
+        media_id=last.get("media_id", ""), label=last.get("label", ""),
+    )
+    # Forget everything that points at this torrent (a season pack can back
+    # many episodes) so the next play does a fresh lookup without it.
+    StreamCache(_USERDATA_PATH).clear_hash(torrent_hash)
+    PackBindingCache(_USERDATA_PATH).clear_hash(torrent_hash)
+    _log(f"User blocked source {torrent_hash[:8]} ({release!r})")
+    xbmcgui.Dialog().notification(
+        "KDMM", "Source blocked", xbmcgui.NOTIFICATION_INFO,
+    )
+
+
+def _pick_entries(heading, entries, describe):
+    """Multi-select from a newest-first list; return the chosen entries."""
+    picked = xbmcgui.Dialog().multiselect(heading, [describe(e) for e in entries])
+    return [entries[i] for i in picked or []]
+
+
+def action_manage_cache(params):
+    """List cached streams and clear only the ones the user ticks."""
+    stream_cache = StreamCache(_USERDATA_PATH)
+    entries = stream_cache.entries()
+    if not entries:
+        xbmcgui.Dialog().notification(
+            "KDMM", "Stream cache is empty", xbmcgui.NOTIFICATION_INFO,
+        )
+        return
+
+    def describe(entry):
+        name = entry["label"] or entry["media_id"]
+        return f"{name}  -  {entry['file']}" if entry["file"] else name
+
+    chosen = _pick_entries(
+        "KDMM - Clear cached streams (newest first)", entries, describe,
+    )
+    if not chosen:
+        return
+    stream_cache.clear_many([entry["media_id"] for entry in chosen])
+    pack_cache = PackBindingCache(_USERDATA_PATH)
+    for entry in chosen:
+        # Same as clearing one item: an episode also forgets its season's
+        # bound pack so the next play does a full lookup.
+        parts = entry["media_id"].split(":")
+        if len(parts) >= 2:
+            pack_cache.clear(parts[0], parts[1])
+    count = len(chosen)
+    xbmcgui.Dialog().notification(
+        "KDMM",
+        f"Cleared {count} cached stream{'' if count == 1 else 's'}",
+        xbmcgui.NOTIFICATION_INFO,
+    )
+
+
+def action_manage_blocked(params):
+    """List blocked sources and unblock only the ones the user ticks."""
+    blocked = UserBlockedSourceCache(_USERDATA_PATH)
+    entries = blocked.entries()
+    if not entries:
+        xbmcgui.Dialog().notification(
+            "KDMM", "No blocked sources", xbmcgui.NOTIFICATION_INFO,
+        )
+        return
+
+    def describe(entry):
+        release = entry["name"] or entry["hash"][:8]
+        name = entry["label"] or entry["media_id"]
+        return f"{name}  -  {release}" if name else release
+
+    chosen = _pick_entries(
+        "KDMM - Unblock sources (newest first)", entries, describe,
+    )
+    if not chosen:
+        return
+    count = blocked.unblock_many([entry["hash"] for entry in chosen])
+    xbmcgui.Dialog().notification(
+        "KDMM",
+        f"Unblocked {count} source{'' if count == 1 else 's'}",
+        xbmcgui.NOTIFICATION_INFO,
+    )
+
+
+def action_unblock_sources(params):
+    """Forget every source the user blocked."""
+    blocked = UserBlockedSourceCache(_USERDATA_PATH)
+    count = len(blocked)
+    if not count:
+        xbmcgui.Dialog().notification(
+            "KDMM", "No blocked sources", xbmcgui.NOTIFICATION_INFO,
+        )
+        return
+    noun = "source" if count == 1 else "sources"
+    if not xbmcgui.Dialog().yesno(
+        "KDMM - Unblock sources",
+        f"Unblock {count} blocked {noun}?",
+        yeslabel="Unblock",
+        nolabel="Cancel",
+    ):
+        return
+    blocked.clear()
+    xbmcgui.Dialog().notification(
+        "KDMM", f"Unblocked {count} {noun}", xbmcgui.NOTIFICATION_INFO,
+    )
+
+
 def action_clear_progress(params):
     """Reset the locally-stored resume position for one item."""
     imdb = params.get("imdb", "").strip()
@@ -688,6 +862,18 @@ def action_main_menu():
         ("Clear Stream Cache",
          "Force re-fetch stream URLs on next play",
          "plugin://plugin.video.kdmm/?action=clear_cache"),
+        ("Manage Cached Streams",
+         "Pick which cached streams to clear",
+         "plugin://plugin.video.kdmm/?action=manage_cache"),
+        ("Block Last Played Source",
+         "Stop using the source that just played and pick another next time",
+         "plugin://plugin.video.kdmm/?action=block_last_source"),
+        ("Manage Blocked Sources",
+         "Pick which blocked sources to unblock",
+         "plugin://plugin.video.kdmm/?action=manage_blocked"),
+        ("Unblock All Sources",
+         "Allow every source you blocked again",
+         "plugin://plugin.video.kdmm/?action=unblock_sources"),
     ]
 
     listing = []
@@ -721,6 +907,14 @@ def addon_router():
                                       xbmcgui.NOTIFICATION_INFO)
     elif action == "clear_cache":
         action_clear_cache(params)
+    elif action == "block_last_source":
+        action_block_last_source(params)
+    elif action == "manage_cache":
+        action_manage_cache(params)
+    elif action == "manage_blocked":
+        action_manage_blocked(params)
+    elif action == "unblock_sources":
+        action_unblock_sources(params)
     elif action == "clear_progress":
         action_clear_progress(params)
     else:

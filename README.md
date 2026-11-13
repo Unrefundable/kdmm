@@ -18,6 +18,9 @@ TMDb Bingie Helper through cached debrid streams.
   after playback ends or fails.
 - Caches resolved candidates, resume positions, blocked Real-Debrid hashes, and
   preferred TV pack bindings.
+- Lets you block the last played source from the Cache settings when a stream
+  is laggy or bad, so the next play picks a different one, and pick individual
+  cached streams to clear or blocked sources to unblock.
 - Supports local resume, watched progress, and play-from-beginning behavior.
 - Adds IntroDB.app and TheIntroDB-backed skip buttons for intro, recap, credits,
   and preview segments.
@@ -50,4 +53,4 @@ add-on browser.
 
 ## Current Release
 
-The current published add-on version is `2.7.0`.
+The current published add-on version is `2.7.3`.

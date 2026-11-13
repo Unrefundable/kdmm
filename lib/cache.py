@@ -3,6 +3,8 @@ KDMM – lib/cache.py
 Persistent JSON caches for:
   • StreamCache   – resolved stream URL + header map, keyed by media_id.
   • ProgressCache – resume time in seconds, keyed by media_id.
+  • UserBlockedSourceCache – torrent hashes the user blocked by hand.
+  • LastPlayedSource – the source behind the most recent play request.
 
 media_id convention:
   movie   → "tt1234567"
@@ -50,9 +52,12 @@ class StreamCache:
             return None
         return candidates
 
-    def set(self, media_id, candidates):
+    def set(self, media_id, candidates, label=None):
+        if label is None:
+            label = (self._data.get(media_id) or {}).get("label", "")
         self._data[media_id] = {
             "candidates": candidates,
+            "label": label or "",
             "timestamp": time.time(),
         }
         self._save()
@@ -63,6 +68,49 @@ class StreamCache:
         else:
             self._data.clear()
         self._save()
+
+    def entries(self):
+        """Every cached item, newest first, for the manage-cache list."""
+        items = []
+        for media_id, entry in self._data.items():
+            candidates = entry.get("candidates") or []
+            first = candidates[0] if candidates and isinstance(candidates[0], dict) else {}
+            items.append({
+                "media_id": media_id,
+                "label": entry.get("label") or "",
+                "file": first.get("name") or "",
+                "timestamp": entry.get("timestamp", 0),
+            })
+        items.sort(key=lambda item: item["timestamp"], reverse=True)
+        return items
+
+    def clear_many(self, media_ids):
+        removed = 0
+        for media_id in media_ids or []:
+            if self._data.pop(media_id, None) is not None:
+                removed += 1
+        if removed:
+            self._save()
+        return removed
+
+    def clear_hash(self, torrent_hash):
+        """Drop every entry that plays from this torrent; return the count."""
+        torrent_hash = (torrent_hash or "").lower()
+        if not torrent_hash:
+            return 0
+        stale = [
+            media_id for media_id, entry in self._data.items()
+            if any(
+                isinstance(candidate, dict)
+                and (candidate.get("hash") or "").lower() == torrent_hash
+                for candidate in (entry.get("candidates") or [])
+            )
+        ]
+        for media_id in stale:
+            self._data.pop(media_id, None)
+        if stale:
+            self._save()
+        return len(stale)
 
 
 class PackBindingCache:
@@ -136,6 +184,21 @@ class PackBindingCache:
             self._data.clear()
         self._save()
 
+    def clear_hash(self, torrent_hash):
+        """Drop every season bound to this torrent; return the count."""
+        torrent_hash = (torrent_hash or "").lower()
+        if not torrent_hash:
+            return 0
+        stale = [
+            key for key, entry in self._data.items()
+            if (entry.get("hash") or "").lower() == torrent_hash
+        ]
+        for key in stale:
+            self._data.pop(key, None)
+        if stale:
+            self._save()
+        return len(stale)
+
 
 class BlockedHashCache:
     """Cache torrent hashes that RD rejects with a hard legal block."""
@@ -206,6 +269,117 @@ class BlockedHashCache:
             candidate for candidate in candidates
             if not self.is_blocked(candidate.get("hash"))
         ]
+
+
+class UserBlockedSourceCache:
+    """Torrent hashes the user blocked by hand; kept until they unblock them."""
+
+    def __init__(self, userdata_path):
+        self._path = os.path.join(userdata_path, "user_blocked_sources.json")
+        self._data = self._load()
+
+    def _load(self):
+        if os.path.isfile(self._path):
+            try:
+                with open(self._path, "r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+                if isinstance(data, dict):
+                    return data
+            except Exception:
+                pass
+        return {}
+
+    def _save(self):
+        os.makedirs(os.path.dirname(self._path), exist_ok=True)
+        with open(self._path, "w", encoding="utf-8") as fh:
+            json.dump(self._data, fh, indent=2)
+
+    def __len__(self):
+        return len(self._data)
+
+    def is_blocked(self, torrent_hash):
+        torrent_hash = (torrent_hash or "").lower()
+        return bool(torrent_hash and torrent_hash in self._data)
+
+    def block(self, torrent_hash, name="", media_id="", label=""):
+        torrent_hash = (torrent_hash or "").lower()
+        if not torrent_hash:
+            return
+        self._data[torrent_hash] = {
+            "name": name or "",
+            "media_id": media_id or "",
+            "label": label or "",
+            "timestamp": time.time(),
+        }
+        self._save()
+
+    def entries(self):
+        """Every blocked source, newest first, for the manage-blocks list."""
+        items = [
+            {
+                "hash": torrent_hash,
+                "name": entry.get("name") or "",
+                "label": entry.get("label") or "",
+                "media_id": entry.get("media_id") or "",
+                "timestamp": entry.get("timestamp", 0),
+            }
+            for torrent_hash, entry in self._data.items()
+        ]
+        items.sort(key=lambda item: item["timestamp"], reverse=True)
+        return items
+
+    def unblock_many(self, torrent_hashes):
+        removed = 0
+        for torrent_hash in torrent_hashes or []:
+            if self._data.pop((torrent_hash or "").lower(), None) is not None:
+                removed += 1
+        if removed:
+            self._save()
+        return removed
+
+    def clear(self):
+        self._data.clear()
+        self._save()
+
+
+class LastPlayedSource:
+    """Remembers which source the most recent play request used."""
+
+    def __init__(self, userdata_path):
+        self._path = os.path.join(userdata_path, "last_played_source.json")
+
+    def get(self):
+        if os.path.isfile(self._path):
+            try:
+                with open(self._path, "r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+                if isinstance(data, dict) and data.get("hash"):
+                    return data
+            except Exception:
+                pass
+        return None
+
+    def set(self, media_id, candidate, label=""):
+        torrent_hash = ((candidate or {}).get("hash") or "").lower()
+        if not torrent_hash:
+            return
+        os.makedirs(os.path.dirname(self._path), exist_ok=True)
+        with open(self._path, "w", encoding="utf-8") as fh:
+            json.dump({
+                "media_id": media_id,
+                "hash": torrent_hash,
+                "label": label or "",
+                "release": candidate.get("title") or "",
+                "file": candidate.get("name") or "",
+                "provider": candidate.get("provider_label") or "",
+                "timestamp": time.time(),
+            }, fh, indent=2)
+
+    def clear(self):
+        try:
+            os.remove(self._path)
+        except OSError:
+            pass
 
 
 class ProgressCache:
