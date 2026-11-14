@@ -1,7 +1,8 @@
 """Find streams ahead of time for the titles on the skin's widgets.
 
 While the user browses, the service remembers which movies, shows and
-episodes the skin's widget rows are showing. Once Kodi has been idle for ten
+episodes the skin's widget rows are showing (home screen and provider hubs
+alike: whichever window the user rests on). Once Kodi has been idle for ten
 minutes and nothing is playing, a background thread looks up the best stream
 for each of them and stores it in the normal stream cache, so pressing Play
 later is a cache hit. Any remote press or playback start cancels the run.
@@ -37,13 +38,14 @@ SNAPSHOT_MIN_IDLE_SECONDS = 10
 SNAPSHOT_INTERVAL_SECONDS = 30
 CHECK_INTERVAL_SECONDS = 5
 
-MAX_ITEMS_PER_SESSION = 40
-MAX_ITEMS_PER_WIDGET = 30
-MAX_REMEMBERED_ITEMS = 400
+MAX_ITEMS_PER_SESSION = 400
+MAX_ITEMS_PER_WIDGET = 150
+MAX_REMEMBERED_ITEMS = 1000
 MAX_WIDGET_IDS = 250
 PAUSE_BETWEEN_ITEMS_SECONDS = 3
-# Look a pre-resolved Real-Debrid stream up again once it is this old, well
-# before the play path stops trusting it (cache.PREWARM_MAX_AGE_SECONDS).
+# Only for Real-Debrid entries saved without a hoster link (KDMM 2.7.6):
+# look them up again once they are this old, before the play path stops
+# trusting them (cache.PREWARM_MAX_AGE_SECONDS). Newer entries never age out.
 REWARM_AFTER_SECONDS = 20 * 3600
 FAILURE_RETRY_SECONDS = 24 * 3600
 DEFAULT_STREAM_CACHE_TTL_HOURS = 336
@@ -260,9 +262,12 @@ def _cached_is_fresh(stream_cache, media_id):
     age = stream_cache.prewarm_age(media_id)
     if age is None or age < REWARM_AFTER_SECONDS:
         return True
-    # AllDebrid links are rebuilt from the torrent hash on every play.
+    # A link that can be rebuilt at play time never goes stale: AllDebrid by
+    # torrent hash, Real-Debrid by its stored hoster link.
     first = cached[0] if isinstance(cached, list) and cached else cached
-    return isinstance(first, dict) and first.get("provider") == "alldebrid"
+    return isinstance(first, dict) and (
+        first.get("provider") == "alldebrid" or bool(first.get("rd_link"))
+    )
 
 
 # ------------------------------------------------------------------ #

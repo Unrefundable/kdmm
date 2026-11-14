@@ -58,6 +58,7 @@ from cache import (  # noqa: E402 (after sys.path)
 )
 from dmm import (    # noqa: E402
     CachedStreamBlocked,
+    CachedStreamUnavailable,
     candidate_matches_episode_identity,
     candidate_matches_audio_preference,
     cleanup_stream_candidate,
@@ -262,8 +263,12 @@ def _cache_can_refresh_direct_url(cached):
     candidates = cached if isinstance(cached, list) else [cached]
     return any(
         isinstance(candidate, dict)
-        and candidate.get("provider") == "alldebrid"
-        and len((candidate.get("hash") or "")) == 40
+        and (
+            (candidate.get("provider") == "alldebrid"
+             and len((candidate.get("hash") or "")) == 40)
+            or (candidate.get("provider") == "realdebrid"
+                and bool(candidate.get("rd_link")))
+        )
         for candidate in candidates
     )
 
@@ -280,8 +285,9 @@ def _episode_cache_needs_identity_refresh(cached):
 def _prewarmed_cache_is_stale(stream_cache, media_id, cached):
     """An idle pre-resolve stored this entry and its link may have expired.
 
-    AllDebrid entries are exempt: their link is rebuilt from the torrent hash
-    on every play.
+    Entries whose link can be rebuilt (AllDebrid by hash, Real-Debrid by its
+    stored hoster link) are exempt. This only catches Real-Debrid entries
+    saved before hoster links were stored.
     """
     age = stream_cache.prewarm_age(media_id)
     if age is None or age <= PREWARM_MAX_AGE_SECONDS:
@@ -444,7 +450,7 @@ def action_play(params):
                 if _cache_can_refresh_direct_url(cached):
                     _log(
                         f"Refreshing direct URL for {media_id}; "
-                        "cached AllDebrid source identity is still usable"
+                        "cached source identity is still usable"
                     )
                 else:
                     _log(f"Refreshing {media_id}; cached URL may have been consumed by codec probe")
@@ -493,6 +499,15 @@ def action_play(params):
                             )
                             candidates = [refreshed]
                             stream_cache.set(media_id, candidates)
+                        except CachedStreamUnavailable as exc:
+                            _log(
+                                f"Cached stream for {media_id} is gone ({exc}); searching again",
+                                xbmc.LOGWARNING,
+                            )
+                            stream_cache.clear(media_id)
+                            if catalog_type == "series":
+                                pack_cache.clear(imdb, season)
+                            candidates = None
                         except CachedStreamBlocked as exc:
                             _log(
                                 f"Cached stream for {media_id} is blocked by AllDebrid: {exc}",
@@ -511,7 +526,7 @@ def action_play(params):
                             _log(f"Could not refresh cached stream auth: {exc}", xbmc.LOGWARNING)
                             xbmcgui.Dialog().notification(
                                 "KDMM authorization",
-                                "AllDebrid authorization failed",
+                                _auth_error_notice(str(exc))[0],
                                 xbmcgui.NOTIFICATION_ERROR, 8000)
                             xbmcplugin.setResolvedUrl(ADDON_HANDLE, False, xbmcgui.ListItem())
                             return
@@ -520,7 +535,7 @@ def action_play(params):
                                  xbmc.LOGWARNING)
                             xbmcgui.Dialog().notification(
                                 "KDMM playback",
-                                describe_failure(exc, "AllDebrid", "refreshing cached stream"),
+                                describe_failure(exc, "debrid", "refreshing cached stream"),
                                 xbmcgui.NOTIFICATION_ERROR, 8000)
                             xbmcplugin.setResolvedUrl(ADDON_HANDLE, False, xbmcgui.ListItem())
                             return

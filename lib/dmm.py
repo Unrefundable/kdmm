@@ -50,12 +50,20 @@ _RD_AUTH_FAILURE = _AUTH_FAILURE
 _RD_BLOCKED_HASH_KEY = "blocked_hash"
 _PROVIDER_RD = "realdebrid"
 _PROVIDER_AD = "alldebrid"
+# Real-Debrid does not publish a lifetime for generated playback URLs
+# (community tools report about a week). Reuse one for a day at most, then
+# make a new one from the stored hoster link.
+_RD_URL_REUSE_SECONDS = 24 * 3600
 _AUTH_NOTICE_SHOWN = set()
 
 
 class _NetworkFailure:
     def __init__(self, message):
         self.message = message
+
+
+class CachedStreamUnavailable(RuntimeError):
+    """The cached source can no longer be played; look the title up again."""
 
 
 class CachedStreamBlocked(RuntimeError):
@@ -2064,6 +2072,83 @@ def _pick_cached_file(files, candidate, season=None, episode=None,
     return None
 
 
+def _refresh_cached_rd_stream(candidate, season=None, episode=None,
+                              query_title=None, year=None, episode_title=None):
+    """
+    Give a cached Real-Debrid candidate a working playback URL.
+
+    Real-Debrid does not document how long a generated URL lasts, so a URL
+    is reused only while it is recent. After that a new one is made from the
+    stored hoster link (one API call). If Real-Debrid no longer accepts that
+    link, the same torrent is added again by hash; only when that fails too
+    is the caller told to search from scratch.
+    """
+    rd_link = candidate.get("rd_link")
+    if not rd_link:
+        return candidate  # cached before hoster links were stored
+
+    try:
+        age = _time.time() - float(candidate.get("url_time") or 0)
+    except (TypeError, ValueError):
+        age = _RD_URL_REUSE_SECONDS
+    if (candidate.get("url") and candidate.get("url_refreshed_after_probe")
+            and 0 <= age < _RD_URL_REUSE_SECONDS):
+        return candidate
+
+    api_token = _rd_key()
+    if not api_token:
+        raise PermissionError("realdebrid_token_missing")
+
+    h8 = (candidate.get("hash") or "")[:8]
+    try:
+        unrestricted = _rd_post(
+            "/unrestrict/link", api_token, data={"link": rd_link}, timeout=10,
+        )
+        url = unrestricted.get("download")
+        if url:
+            refreshed = dict(candidate)
+            refreshed.update({
+                "url": url,
+                "headers": {},
+                "name": unrestricted.get("filename") or candidate.get("name")
+                        or candidate.get("title", "Stream"),
+                "url_time": _time.time(),
+                "url_refreshed_after_probe": True,
+            })
+            _log(f"{h8} made a new RD playback URL for {refreshed['name']!r}")
+            return refreshed
+        reason = "no playback URL returned"
+    except Exception as exc:
+        if "401" in str(exc):
+            raise PermissionError("realdebrid_token_rejected")
+        if is_network_exception(exc):
+            raise
+        reason = str(exc)
+
+    _log(f"{h8} stored RD file link was refused ({reason}); adding the same torrent again",
+         xbmc.LOGWARNING)
+    torrent_hash = (candidate.get("hash") or "").lower()
+    if len(torrent_hash) != 40:
+        raise CachedStreamUnavailable("cached Real-Debrid source has no torrent hash")
+    resolved = _try_resolve_one(
+        {
+            "hash": torrent_hash,
+            "title": candidate.get("title", ""),
+            "pack_scope": candidate.get("pack_scope", ""),
+            "pack_rank": candidate.get("pack_rank"),
+        },
+        api_token, season, episode, None,
+        query_title=query_title, year=year, episode_title=episode_title,
+    )
+    if resolved is _RD_AUTH_FAILURE:
+        raise PermissionError("realdebrid_token_rejected")
+    if isinstance(resolved, _NetworkFailure):
+        raise RuntimeError(str(getattr(resolved, "message", "") or "Real-Debrid is unreachable"))
+    if isinstance(resolved, dict) and resolved.get("url"):
+        return resolved
+    raise CachedStreamUnavailable(f"cached Real-Debrid source {h8} is no longer available")
+
+
 def refresh_cached_stream(candidate, season=None, episode=None,
                           query_title=None, year=None, episode_title=None):
     """
@@ -2072,6 +2157,11 @@ def refresh_cached_stream(candidate, season=None, episode=None,
     """
     if not isinstance(candidate, dict):
         return candidate
+    if candidate.get("provider") == _PROVIDER_RD:
+        return _refresh_cached_rd_stream(
+            candidate, season=season, episode=episode, query_title=query_title,
+            year=year, episode_title=episode_title,
+        )
     if candidate.get("provider") != _PROVIDER_AD:
         return candidate
     torrent_hash = (candidate.get("hash") or "").lower()
@@ -2404,6 +2494,11 @@ def _try_resolve_one(candidate, api_token, season, episode, cancel_event,
                 "audio_language_preference": audio_preference,
                 "audio_language_probe": "matched" if audio_probe is True else "unknown",
                 "url_refreshed_after_probe": url_refreshed,
+                # The hoster link identifies this exact file on Real-Debrid.
+                # A playback URL is only a temporary product of it, so keep
+                # the link and make a new URL from it when the old one ages.
+                "rd_link": link_to_use,
+                "url_time": _time.time(),
                 "provider": _PROVIDER_RD,
                 "provider_label": _provider_label(_PROVIDER_RD),
             }
