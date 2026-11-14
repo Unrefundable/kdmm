@@ -39,6 +39,17 @@ def _save(userdata_path, data):
         _log(f"Could not persist settings: {exc}", xbmc.LOGWARNING)
 
 
+def get_flag(userdata_path, key):
+    """True once set_flag() has recorded this one-time step as done."""
+    return bool(_load(userdata_path).get(key))
+
+
+def set_flag(userdata_path, key):
+    saved = _load(userdata_path)
+    saved[key] = True
+    _save(userdata_path, saved)
+
+
 def get_stream_cache_ttl_hours(userdata_path):
     """
     Kodi can reset number settings to the old addon default after updates.

@@ -75,14 +75,15 @@ It also covers what happens around playback: resume and watched progress, skip b
 2. Go to **Add-ons › Install from zip file**, open the source you added, and install `repository.unrefundable.kdmm-1.0.0.zip`.
 3. Go to **Install from repository › Unrefundable KDMM Repo › Video add-ons** and install **KDMM**.
 4. Open KDMM's settings and authorize Real-Debrid, AllDebrid or both under **Debrid Accounts**.
-5. In TMDb Bingie Helper, choose **KDMM** as the player.
+
+KDMM makes itself TMDb Bingie Helper's default player the first time it runs. To choose a different player later, change it in the helper's settings under **Players**; KDMM's **Make KDMM the default player** setting switches it back.
 
 From then on, Kodi keeps KDMM up to date through the repository.
 
 ## Requirements
 
 - **Kodi 21 or newer**, with Python 3 add-on support.
-- **TMDb Bingie Helper**, configured to use the KDMM player.
+- **TMDb Bingie Helper**. KDMM sets itself as its default player on first run.
 - **A Real-Debrid or AllDebrid account**, authorized in KDMM's settings.
 - `script.module.requests`, which Kodi installs automatically.
 - `script.module.qrcode` is optional. It shows a QR code for Real-Debrid device-code authorization.

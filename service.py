@@ -23,6 +23,7 @@ _USERDATA_PATH = xbmcvfs.translatePath(
 sys.path.insert(0, os.path.join(_ADDON_PATH, "lib"))
 
 from cache import ProgressCache   # noqa: E402
+from default_player import claim_default_player_once  # noqa: E402
 from details_page import open_details  # noqa: E402
 from device_tuning import apply_device_tuning  # noqa: E402
 from dmm import cleanup_stream_candidate  # noqa: E402
@@ -713,6 +714,10 @@ class BridgeMonitor(xbmc.Monitor):
             _install_player_json()
         except Exception as exc:
             _log(f"_install_player_json failed: {exc}", xbmc.LOGWARNING)
+        try:
+            claim_default_player_once(_USERDATA_PATH)
+        except Exception as exc:
+            _log(f"claim_default_player_once failed: {exc}", xbmc.LOGWARNING)
         get_stream_cache_ttl_hours(_USERDATA_PATH)
         disable_legacy_addon()
         self._install_keymaps()

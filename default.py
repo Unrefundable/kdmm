@@ -887,6 +887,17 @@ def action_main_menu():
     xbmcplugin.endOfDirectory(ADDON_HANDLE)
 
 
+def action_set_default_player(params):
+    """Make KDMM the helper's default player, replacing any other choice."""
+    from default_player import set_default_player
+    if set_default_player(force=True) is None:
+        xbmcgui.Dialog().notification("KDMM", "TMDb Bingie Helper is not installed",
+                                      xbmcgui.NOTIFICATION_WARNING)
+        return
+    xbmcgui.Dialog().notification("KDMM", "KDMM is the default player for movies and episodes",
+                                  xbmcgui.NOTIFICATION_INFO)
+
+
 def addon_router():
     params = dict(parse_qsl(sys.argv[2][1:])) if len(sys.argv) > 2 else {}
     action = params.get("action", "")
@@ -917,6 +928,8 @@ def addon_router():
         action_unblock_sources(params)
     elif action == "clear_progress":
         action_clear_progress(params)
+    elif action == "set_default_player":
+        action_set_default_player(params)
     else:
         action_main_menu()
 
