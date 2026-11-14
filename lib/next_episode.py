@@ -153,6 +153,19 @@ def _direct_tmdb_next_episode(context, season, episode):
     return None
 
 
+def next_episode_from_tmdb(context):
+    """Next episode straight from TMDb, without TMDb Bingie Helper's code.
+
+    Plain HTTP only, so it is safe to call from a background thread.
+    """
+    context = context or {}
+    season = _extract_int(context.get("season"))
+    episode = _extract_int(context.get("episode"))
+    if not season or not episode:
+        return None
+    return _direct_tmdb_next_episode(context, season, episode)
+
+
 def _item_episode_key(item):
     infolabels = {}
     if isinstance(item, dict):

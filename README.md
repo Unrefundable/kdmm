@@ -60,6 +60,7 @@ It also covers what happens around playback: resume and watched progress, skip b
 
 ### Cache and source control
 - **Stream cache.** Resolved streams and preferred TV pack bindings are cached, so replays and the next episode start faster. You choose how long the cache lasts.
+- **Streams ready before you press Play (optional).** Turn on *Find streams for home screen titles after 10 idle minutes* and KDMM looks up the best stream for the movies and in-progress shows on your skin's widgets while Kodi sits idle. Any remote press stops it. Off by default.
 - **Block a bad source.** If a stream is laggy or broken, block the last played source and the next play picks a different one.
 - **Manage both lists.** Clear individual cached streams or all of them, and unblock individual sources or all of them.
 

@@ -15,6 +15,20 @@ import json
 import os
 import time
 
+# A stream found ahead of time (see prewarm.py) holds a debrid URL that was
+# never opened. Past this age a Real-Debrid entry is looked up again at play
+# time instead of handing Kodi a link that may have expired.
+PREWARM_MAX_AGE_SECONDS = 30 * 3600
+
+
+def _write_json(path, data):
+    """Write through a temp file so a reader never sees a half-written cache."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp_path = f"{path}.{os.getpid()}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2)
+    os.replace(tmp_path, path)
+
 
 class StreamCache:
     """Cache for resolved stream URLs so we don't re-query every play."""
@@ -36,9 +50,12 @@ class StreamCache:
         return {}
 
     def _save(self):
-        os.makedirs(os.path.dirname(self._path), exist_ok=True)
-        with open(self._path, "w", encoding="utf-8") as fh:
-            json.dump(self._data, fh, indent=2)
+        _write_json(self._path, self._data)
+
+    def _reload(self):
+        # The plugin and the service each hold their own copy of this file.
+        # Re-read it before every change so one never drops the other's entries.
+        self._data = self._load()
 
     def get(self, media_id):
         entry = self._data.get(media_id)
@@ -52,17 +69,29 @@ class StreamCache:
             return None
         return candidates
 
-    def set(self, media_id, candidates, label=None):
+    def prewarm_age(self, media_id):
+        """Seconds since this entry was found ahead of time, else None."""
+        entry = self._data.get(media_id) or {}
+        if not entry.get("prewarmed"):
+            return None
+        return time.time() - entry.get("timestamp", 0)
+
+    def set(self, media_id, candidates, label=None, prewarmed=False):
+        self._reload()
         if label is None:
             label = (self._data.get(media_id) or {}).get("label", "")
-        self._data[media_id] = {
+        entry = {
             "candidates": candidates,
             "label": label or "",
             "timestamp": time.time(),
         }
+        if prewarmed:
+            entry["prewarmed"] = True
+        self._data[media_id] = entry
         self._save()
 
     def clear(self, media_id=None):
+        self._reload()
         if media_id:
             self._data.pop(media_id, None)
         else:
@@ -85,6 +114,7 @@ class StreamCache:
         return items
 
     def clear_many(self, media_ids):
+        self._reload()
         removed = 0
         for media_id in media_ids or []:
             if self._data.pop(media_id, None) is not None:
@@ -98,6 +128,7 @@ class StreamCache:
         torrent_hash = (torrent_hash or "").lower()
         if not torrent_hash:
             return 0
+        self._reload()
         stale = [
             media_id for media_id, entry in self._data.items()
             if any(
@@ -133,9 +164,7 @@ class PackBindingCache:
         return {}
 
     def _save(self):
-        os.makedirs(os.path.dirname(self._path), exist_ok=True)
-        with open(self._path, "w", encoding="utf-8") as fh:
-            json.dump(self._data, fh, indent=2)
+        _write_json(self._path, self._data)
 
     def _key(self, imdb_id, season):
         if not imdb_id or not season:
@@ -221,9 +250,7 @@ class BlockedHashCache:
         return {}
 
     def _save(self):
-        os.makedirs(os.path.dirname(self._path), exist_ok=True)
-        with open(self._path, "w", encoding="utf-8") as fh:
-            json.dump(self._data, fh, indent=2)
+        _write_json(self._path, self._data)
 
     def _prune(self):
         now = time.time()
@@ -290,9 +317,7 @@ class UserBlockedSourceCache:
         return {}
 
     def _save(self):
-        os.makedirs(os.path.dirname(self._path), exist_ok=True)
-        with open(self._path, "w", encoding="utf-8") as fh:
-            json.dump(self._data, fh, indent=2)
+        _write_json(self._path, self._data)
 
     def __len__(self):
         return len(self._data)
@@ -399,9 +424,24 @@ class ProgressCache:
         return {}
 
     def _save(self):
-        os.makedirs(os.path.dirname(self._path), exist_ok=True)
-        with open(self._path, "w", encoding="utf-8") as fh:
-            json.dump(self._data, fh, indent=2)
+        _write_json(self._path, self._data)
+
+    def is_watched(self, media_id):
+        return bool((self._data.get(media_id) or {}).get("watched"))
+
+    def episodes_for(self, imdb_id):
+        """Every stored episode of a show as (season, episode, entry)."""
+        prefix = f"{imdb_id}:"
+        found = []
+        for media_id, entry in self._data.items():
+            if not media_id.startswith(prefix) or not isinstance(entry, dict):
+                continue
+            parts = media_id.split(":")
+            try:
+                found.append((int(parts[1]), int(parts[2]), entry))
+            except (IndexError, ValueError):
+                continue
+        return found
 
     def get_resume_time(self, media_id):
         entry = self._data.get(media_id, {})

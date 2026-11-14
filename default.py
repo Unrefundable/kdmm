@@ -49,6 +49,7 @@ NO_RESUME = len(sys.argv) > 3 and "resume:false" in sys.argv[3].lower()
 sys.path.insert(0, os.path.join(_ADDON_PATH, "lib"))
 
 from cache import (  # noqa: E402 (after sys.path)
+    PREWARM_MAX_AGE_SECONDS,
     LastPlayedSource,
     PackBindingCache,
     ProgressCache,
@@ -276,6 +277,18 @@ def _episode_cache_needs_identity_refresh(cached):
     )
 
 
+def _prewarmed_cache_is_stale(stream_cache, media_id, cached):
+    """An idle pre-resolve stored this entry and its link may have expired.
+
+    AllDebrid entries are exempt: their link is rebuilt from the torrent hash
+    on every play.
+    """
+    age = stream_cache.prewarm_age(media_id)
+    if age is None or age <= PREWARM_MAX_AGE_SECONDS:
+        return False
+    return not _cache_can_refresh_direct_url(cached)
+
+
 def _cache_is_user_blocked(cached):
     candidates = cached if isinstance(cached, list) else [cached]
     blocked = UserBlockedSourceCache(_USERDATA_PATH)
@@ -420,6 +433,10 @@ def action_play(params):
         cached = stream_cache.get(media_id)
         if cached and _cache_is_user_blocked(cached):
             _log(f"Refreshing {media_id}; cached source was blocked by the user")
+            stream_cache.clear(media_id)
+            cached = None
+        if cached and _prewarmed_cache_is_stale(stream_cache, media_id, cached):
+            _log(f"Refreshing {media_id}; stream found while idle is too old to trust")
             stream_cache.clear(media_id)
             cached = None
         if cached:

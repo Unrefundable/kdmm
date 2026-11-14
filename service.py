@@ -4,6 +4,7 @@ title page after playback, and the remote keymaps."""
 import json
 import os
 import sys
+import threading
 import time
 
 import xbmc
@@ -30,6 +31,8 @@ from dmm import cleanup_stream_candidate  # noqa: E402
 from introdb_client import query_all_segments  # noqa: E402
 from next_episode import get_next_episode, play_next_episode  # noqa: E402
 from playback import decode_playback_context  # noqa: E402
+from prewarm import PrewarmController  # noqa: E402
+import transition  # noqa: E402
 from remote import SeekAccumulator, disable_legacy_addon, install_keymaps  # noqa: E402
 from segment_overlay import show_skip_overlay  # noqa: E402
 from settings_persistence import get_stream_cache_ttl_hours  # noqa: E402
@@ -90,7 +93,6 @@ PROP_MEDIA_ID = "kdmm.media_id"
 PROP_RESUME_TIME = "kdmm.resume_time"
 PROP_CANDIDATES = "kdmm.candidates"
 PROP_PLAYBACK_CONTEXT = "kdmm.playback_context"
-PROP_NEXT_EPISODE_TRANSITION = "kdmm.next_episode_transition"
 PROP_PENDING_PLAYBACK = "kdmm.pending_playback"
 
 WATCHED_MARGIN_SECONDS = 60
@@ -100,6 +102,8 @@ SEGMENT_END_MARGIN_SECONDS = 0.25
 NEXT_EPISODE_FALLBACK_SECONDS = 45
 POST_CREDITS_SCENE_MIN_SECONDS = 20
 RETURN_TO_DETAILS_WAIT_SECONDS = 5
+STOP_BEFORE_NEXT_TIMEOUT_SECONDS = 8
+CLEANUP_JOIN_TIMEOUT_SECONDS = 5
 
 
 def _log(msg, level=xbmc.LOGINFO):
@@ -183,11 +187,11 @@ class SegmentController:
         if filename != self._current_file:
             self.reset()
             self._current_file = filename
-            WIN.clearProperty(PROP_NEXT_EPISODE_TRANSITION)
+            transition.clear()
             _log(f"Segment tracking reset for file: {filename}")
 
         context = player._playback_context or {}
-        if WIN.getProperty(PROP_NEXT_EPISODE_TRANSITION):
+        if transition.active():
             return
         current_time = player._last_known_time if player._last_known_time > 0 else self._safe_get_time(player)
         total_time = player._last_known_total if player._last_known_total > 0 else self._safe_get_total(player)
@@ -239,9 +243,7 @@ class SegmentController:
                 )
                 if pressed:
                     _log(f"Opening next episode S{next_episode['season']}E{next_episode['episode']}")
-                    WIN.setProperty(PROP_NEXT_EPISODE_TRANSITION, "1")
-                    if not play_next_episode(next_episode):
-                        WIN.clearProperty(PROP_NEXT_EPISODE_TRANSITION)
+                    player.switch_to_episode(next_episode, monitor)
                 continue
 
             pressed = show_skip_overlay(
@@ -325,9 +327,7 @@ class SegmentController:
         )
         if pressed:
             _log(f"Opening fallback next episode S{next_episode['season']}E{next_episode['episode']}")
-            WIN.setProperty(PROP_NEXT_EPISODE_TRANSITION, "1")
-            if not play_next_episode(next_episode):
-                WIN.clearProperty(PROP_NEXT_EPISODE_TRANSITION)
+            player.switch_to_episode(next_episode, monitor)
 
     @staticmethod
     def _safe_get_time(player):
@@ -360,6 +360,7 @@ class BridgePlayer(xbmc.Player):
         self._progress_cache = ProgressCache(_USERDATA_PATH)
         self._playback_context = {}
         self._was_fullscreen = False
+        self._cleanup_threads = []
 
     def tick(self):
         if self._current_media_id and self.isPlaying():
@@ -425,7 +426,7 @@ class BridgePlayer(xbmc.Player):
         self._current_candidate = self._candidate_for_url(self._current_url)
         WIN.clearProperty(PROP_MEDIA_ID)
         WIN.clearProperty(PROP_PENDING_PLAYBACK)
-        WIN.clearProperty(PROP_NEXT_EPISODE_TRANSITION)
+        transition.clear()
 
         resume_str = WIN.getProperty(PROP_RESUME_TIME)
         WIN.clearProperty(PROP_RESUME_TIME)
@@ -438,7 +439,6 @@ class BridgePlayer(xbmc.Player):
 
             if resume_time > 5.0:
                 _log(f"Applying resume seek to {resume_time:.1f}s for {media_id}")
-                import threading
                 def _seek():
                     xbmc.sleep(1200)
                     try:
@@ -516,16 +516,64 @@ class BridgePlayer(xbmc.Player):
                 failed_url=self._current_url,
             )
         else:
-            self._cleanup_current_candidate()
-            self._save_progress(is_ended=is_ended)
+            # A play request that resolved while this item was still playing
+            # has already written its own window properties; they belong to
+            # the new item and must survive this (late) stop callback.
+            new_playback_pending = bool(WIN.getProperty(PROP_PENDING_PLAYBACK))
+            self._cleanup_current_candidate(include_window=not new_playback_pending)
+            self._save_progress(is_ended=is_ended, clear_window=not new_playback_pending)
             if next_episode:
                 self._open_next_episode(next_episode)
             elif was_fullscreen and _setting_bool("return_to_details", True):
                 self._return_to_details(playback_context)
 
-    def _return_to_details(self, context):
-        import threading
+    def switch_to_episode(self, next_episode, monitor):
+        """Stop the current stream completely, then open the next episode.
 
+        The lookup for the next episode must never run under live playback:
+        the old stream's stop callback would land after the new item's state
+        was written, and on Amlogic boxes two streams would overlap.
+        """
+        transition.begin()
+        if self.isPlaying():
+            self._stop_and_wait(monitor)
+        self._join_cleanups(CLEANUP_JOIN_TIMEOUT_SECONDS)
+        if monitor.abortRequested():
+            transition.clear()
+            return False
+        if play_next_episode(next_episode):
+            return True
+        transition.clear()
+        _log("Next-episode playback could not be opened", xbmc.LOGWARNING)
+        return False
+
+    def _stop_and_wait(self, monitor):
+        _log("Stopping playback before looking up the next episode")
+        try:
+            self.stop()
+        except Exception as exc:
+            _log(f"stop() failed: {exc}", xbmc.LOGWARNING)
+        deadline = time.time() + STOP_BEFORE_NEXT_TIMEOUT_SECONDS
+        while time.time() < deadline:
+            # waitForAbort also lets Kodi deliver the stop callback, which
+            # saves progress and clears _current_media_id.
+            if monitor.waitForAbort(0.1):
+                return
+            if not self.isPlaying() and not self._current_media_id:
+                return
+        if self.isPlaying():
+            _log("Playback is still running after stop(); continuing anyway", xbmc.LOGWARNING)
+        elif self._current_media_id:
+            _log("Stop callback did not arrive; saving progress directly", xbmc.LOGWARNING)
+            self._handle_playback_stop(is_ended=False)
+
+    def _join_cleanups(self, timeout):
+        deadline = time.time() + timeout
+        for thread in self._cleanup_threads:
+            thread.join(max(0.0, deadline - time.time()))
+        self._cleanup_threads = [t for t in self._cleanup_threads if t.is_alive()]
+
+    def _return_to_details(self, context):
         def _open():
             if self._wait_for_menu():
                 open_details(context)
@@ -543,7 +591,7 @@ class BridgePlayer(xbmc.Player):
         while time.time() < deadline:
             if (
                 self.isPlayingVideo()
-                or WIN.getProperty(PROP_NEXT_EPISODE_TRANSITION)
+                or transition.active()
                 or WIN.getProperty(PROP_PENDING_PLAYBACK)
                 or WIN.getProperty(PROP_MEDIA_ID)
             ):
@@ -559,16 +607,15 @@ class BridgePlayer(xbmc.Player):
         return False
 
     def _open_next_episode(self, next_episode):
-        import threading
-
         def _open():
             xbmc.sleep(800)
+            self._join_cleanups(CLEANUP_JOIN_TIMEOUT_SECONDS)
             _log(
                 f"Auto-playing next episode S{next_episode['season']}E{next_episode['episode']}"
             )
-            WIN.setProperty(PROP_NEXT_EPISODE_TRANSITION, "1")
+            transition.begin()
             if not play_next_episode(next_episode):
-                WIN.clearProperty(PROP_NEXT_EPISODE_TRANSITION)
+                transition.clear()
                 _log("Automatic next-episode playback failed", xbmc.LOGWARNING)
 
         threading.Thread(target=_open, daemon=True).start()
@@ -605,12 +652,13 @@ class BridgePlayer(xbmc.Player):
         if not self._candidate_has_provider_state(candidate):
             return
 
-        import threading
-
         def _cleanup():
             cleanup_stream_candidate(candidate)
 
-        threading.Thread(target=_cleanup, daemon=True).start()
+        thread = threading.Thread(target=_cleanup, daemon=True)
+        thread.start()
+        self._cleanup_threads = [t for t in self._cleanup_threads if t.is_alive()]
+        self._cleanup_threads.append(thread)
 
     def _cleanup_candidates(self, candidates):
         seen = set()
@@ -626,14 +674,31 @@ class BridgePlayer(xbmc.Player):
             seen.add(key)
             self._cleanup_candidate(candidate)
 
-    def _cleanup_current_candidate(self):
+    def _cleanup_current_candidate(self, include_window=True):
         candidates = []
         if self._current_candidate:
             candidates.append(self._current_candidate)
-        candidates.extend(self._load_candidates())
+        if include_window:
+            candidates.extend(self._load_candidates())
+        else:
+            # The window list now describes the next item. Keep any provider
+            # state it shares with the item that just stopped (a season pack
+            # backs both episodes with the same AllDebrid magnet).
+            keep = {self._provider_state_key(c) for c in self._load_candidates()}
+            candidates = [c for c in candidates if self._provider_state_key(c) not in keep]
         self._current_candidate = None
         self._cleanup_candidates(candidates)
-        WIN.clearProperty(PROP_CANDIDATES)
+        if include_window:
+            WIN.clearProperty(PROP_CANDIDATES)
+
+    @staticmethod
+    def _provider_state_key(candidate):
+        if not isinstance(candidate, dict):
+            return None
+        return (
+            candidate.get("provider"),
+            str(candidate.get("provider_item_id") or candidate.get("ad_magnet_id") or ""),
+        )
 
     def _clear_failed_stream(self, media_id, message="Playback failed",
                              failed_candidate=None, failed_url=""):
@@ -652,14 +717,15 @@ class BridgePlayer(xbmc.Player):
             8000,
         )
 
-    def _save_progress(self, is_ended):
+    def _save_progress(self, is_ended, clear_window=True):
         media_id = self._current_media_id
         if not media_id:
             return
         self._current_media_id = None
-        WIN.clearProperty(PROP_PENDING_PLAYBACK)
-        WIN.clearProperty(PROP_PLAYBACK_CONTEXT)
-        WIN.clearProperty(PROP_CANDIDATES)
+        if clear_window:
+            WIN.clearProperty(PROP_PENDING_PLAYBACK)
+            WIN.clearProperty(PROP_PLAYBACK_CONTEXT)
+            WIN.clearProperty(PROP_CANDIDATES)
         self._playback_context = {}
 
         current_time = self._last_known_time
@@ -692,6 +758,7 @@ class BridgeMonitor(xbmc.Monitor):
         self.player = BridgePlayer()
         self.segment_controller = SegmentController()
         self.seek = SeekAccumulator()
+        self.prewarm = PrewarmController(_USERDATA_PATH)
 
     def onNotification(self, sender, method, data):  # noqa: N802
         # Sent by NotifyAll(plugin.video.kdmm,<action>) in kdmm_seek.xml.
@@ -700,6 +767,7 @@ class BridgeMonitor(xbmc.Monitor):
 
     def onSettingsChanged(self):  # noqa: N802
         self._install_keymaps()
+        self.prewarm.refresh_settings()
 
     def _install_keymaps(self):
         install_keymaps(
@@ -727,7 +795,9 @@ class BridgeMonitor(xbmc.Monitor):
             self.player.tick()
             self.segment_controller.tick(self.player, self)
             self.seek.tick(self.player)
+            self.prewarm.tick(self.player)
             self.waitForAbort(0.5)
+        self.prewarm.stop()
         _log("Service stopped")
 
 

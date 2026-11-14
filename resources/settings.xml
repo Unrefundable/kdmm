@@ -47,6 +47,7 @@
     <category label="Cache">
         <setting id="stream_cache_ttl_hours" type="number" label="Stream cache duration (hours)" default="336"/>
         <setting id="notify_cache_hit" type="bool" label="Notify on cache hit" default="false"/>
+        <setting id="prewarm_widgets" type="bool" label="Find streams for home screen titles after 10 idle minutes" default="false"/>
         <setting id="manage_stream_cache" type="action" label="Choose cached streams to clear" action="RunPlugin(plugin://plugin.video.kdmm/?action=manage_cache)"/>
         <setting id="clear_stream_cache" type="action" label="Clear all cached streams" action="RunPlugin(plugin://plugin.video.kdmm/?action=clear_cache)"/>
         <setting id="block_last_source" type="action" label="Block last played source (laggy or bad stream)" action="RunPlugin(plugin://plugin.video.kdmm/?action=block_last_source)"/>

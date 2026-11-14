@@ -2814,7 +2814,8 @@ def is_stream_accessible(url, headers):
 
 def fetch_all_cached_streams(catalog_type, video_id, cancel_event=None,
                              query_title=None, year=None, userdata_path=None,
-                             ignore_pack_binding=False, episode_title=None):
+                             ignore_pack_binding=False, episode_title=None,
+                             quiet=False):
     """
     Main entry point.  Looks up torrent hashes (Torrentio, plus DMM's
     sponsor API when a key is set), then resolves cached
@@ -2827,7 +2828,17 @@ def fetch_all_cached_streams(catalog_type, video_id, cancel_event=None,
 
     catalog_type: "movie" or "series"
     video_id:     "tt1234567" for movies, "tt1234567:1:2" for episodes
+    quiet:        log only, never show a notification (idle pre-resolve)
     """
+    def _notify(message, duration):
+        if not quiet:
+            xbmcgui.Dialog().notification(
+                "KDMM", message, xbmcgui.NOTIFICATION_WARNING, duration)
+
+    def _notify_auth_failure(provider, reason):
+        if not quiet:
+            _notify_provider_auth_failure(provider, reason)
+
     debrid_accounts = _get_debrid_accounts()
     if not debrid_accounts:
         _log("No debrid access token — authorization required", xbmc.LOGWARNING)
@@ -2902,7 +2913,7 @@ def fetch_all_cached_streams(catalog_type, video_id, cancel_event=None,
                     except PermissionError as exc:
                         _log(f"{_provider_short(provider)} auth failed while trying bound pack: {exc}",
                              xbmc.LOGWARNING)
-                        _notify_provider_auth_failure(provider, str(exc))
+                        _notify_auth_failure(provider, str(exc))
                         continue
                     if blocked_cache and blocked_hashes:
                         blocked_cache.mark_many(blocked_hashes)
@@ -2931,9 +2942,7 @@ def fetch_all_cached_streams(catalog_type, video_id, cancel_event=None,
 
     if not dmm_results:
         _log(f"No torrents found for {video_id}")
-        xbmcgui.Dialog().notification(
-            "KDMM", "No torrents found",
-            xbmcgui.NOTIFICATION_WARNING, 5000)
+        _notify("No torrents found", 5000)
         return []
 
     if catalog_type != "movie":
@@ -2958,10 +2967,7 @@ def fetch_all_cached_streams(catalog_type, video_id, cancel_event=None,
             _log(f"Skipped {skipped} source(s) blocked by the user")
 
     if not dmm_results:
-        xbmcgui.Dialog().notification(
-            "KDMM",
-            "No playable streams",
-            xbmcgui.NOTIFICATION_WARNING, 6000)
+        _notify("No playable streams", 6000)
         return []
 
     # Build hash → result map
@@ -2973,9 +2979,7 @@ def fetch_all_cached_streams(catalog_type, video_id, cancel_event=None,
 
     if not hash_map:
         _log("No valid hashes in torrent lookup results")
-        xbmcgui.Dialog().notification(
-            "KDMM", "No playable streams",
-            xbmcgui.NOTIFICATION_WARNING, 5000)
+        _notify("No playable streams", 5000)
         return []
 
     # 2. Sort candidates using quality preferences from settings
@@ -3071,7 +3075,7 @@ def fetch_all_cached_streams(catalog_type, video_id, cancel_event=None,
                 _log(f"{_provider_short(provider)} auth failed; trying next provider: {exc}",
                      xbmc.LOGWARNING)
                 auth_failed_providers.add(provider)
-                _notify_provider_auth_failure(provider, str(exc))
+                _notify_auth_failure(provider, str(exc))
                 continue
             if blocked_cache and blocked_hashes:
                 blocked_cache.mark_many(blocked_hashes)
@@ -3084,9 +3088,7 @@ def fetch_all_cached_streams(catalog_type, video_id, cancel_event=None,
             raise PermissionError("all_debrid_tokens_rejected")
 
     if not resolved:
-        xbmcgui.Dialog().notification(
-            "KDMM", "No playable streams",
-            xbmcgui.NOTIFICATION_WARNING, 6000)
+        _notify("No playable streams", 6000)
     else:
         top = resolved[0]
         source = top.get("source_file") or top.get("title") or top["name"]
