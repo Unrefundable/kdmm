@@ -287,7 +287,9 @@ def query_all_segments(tmdb_id=None, imdb_id=None, season=None, episode=None, is
     answered = False
     for url, mode in urls:
         _log(f"Query ({mode}): {url}")
-        data = _do_request(url, api_key)
+        # The key is a TheIntroDB bearer token; IntroDB.app is a separate
+        # provider and must not be sent it.
+        data = _do_request(url, api_key if mode.startswith("theintrodb") else "")
         if data is not None:
             answered = True
         if not data:

@@ -82,5 +82,18 @@ class QueryAllSegmentsTest(unittest.TestCase):
         self.assertEqual([s["end"] for s in self.query()["intro"]], [23.0])
 
 
+    def test_the_key_goes_to_theintrodb_only(self):
+        kodi_stubs.FakeAddon.settings["introdb_api_key"] = "secret"
+        sent = {}
+
+        def record(url, key):
+            sent[url.split("/")[2]] = key
+            return {}
+
+        client._do_request = record
+        self.query()
+        self.assertEqual(sent, {"api.theintrodb.org": "secret", "api.introdb.app": ""})
+
+
 if __name__ == "__main__":
     unittest.main()
