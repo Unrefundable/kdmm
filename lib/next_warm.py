@@ -66,6 +66,9 @@ class NextEpisodeWarmer:
             # Playback ended or another title is starting: a lookup still in
             # flight must not compete with, or clean up under, the play path.
             self._cancel.set()
+            if not playing:
+                # Watching the same episode again later may look ahead again.
+                self._started_for = None
             return
         if context.get("is_movie") or media_id == self._started_for:
             return
@@ -140,10 +143,14 @@ class NextEpisodeWarmer:
         # Never release the magnet behind the episode that is playing: a
         # season pack backs this episode and the next with the same one.
         keep = provider_state_key(playing_candidate)
-        for candidate in candidates:
-            key = provider_state_key(candidate)
-            if key is None or key != keep:
-                cleanup_stream_candidate(candidate)
+        if keep is None and (playing_candidate is None or playing_candidate.get("provider") == "alldebrid"):
+            # Which magnet backs the playing episode is unknown, so none can
+            # be released safely. The stop handler and the next play clean up.
+            _log("Playing source unknown; leaving provider state in place")
+        else:
+            for candidate in candidates:
+                if provider_state_key(candidate) != keep:
+                    cleanup_stream_candidate(candidate)
 
         playable = _playable(candidates, target)
         if not playable:

@@ -338,6 +338,10 @@ def _fetch_url_sample(url, headers=None, start=0, size=_CODEC_PROBE_BYTES, timeo
         )
         if resp.status_code not in (200, 206):
             return b""
+        if resp.status_code == 200 and start > 0:
+            # The server ignored Range: this is the start of the file, not
+            # the part that was asked for.
+            return b""
         chunks = []
         remaining = size
         for chunk in resp.iter_content(chunk_size=64 * 1024):
@@ -2961,7 +2965,7 @@ def is_stream_accessible(url, headers):
         if not accessible:
             _log(
                 f"Stream rejected: {cl // 1024 // 1024} MB < "
-                f"{_MIN_STREAM_BYTES // 1024 // 1024} MB threshold ({url[:60]}…)",
+                f"{_MIN_STREAM_BYTES // 1024 // 1024} MB threshold",
                 xbmc.LOGWARNING,
             )
         return accessible

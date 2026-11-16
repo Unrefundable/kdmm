@@ -62,8 +62,12 @@ def _write_tokens(data):
         # xbmcvfs.File.write() only accepts bytearray (not bytes) so it silently
         # writes 0 bytes on Android when given a bytes object — causing auth loss.
         real_path = xbmcvfs.translatePath(_tokens_path())
-        with open(real_path, "w", encoding="utf-8") as f:
+        # Written to a temp file first: a plugin killed mid-write must not
+        # leave an empty token file and lose the authorization.
+        tmp_path = f"{real_path}.{os.getpid()}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(data, f)
+        os.replace(tmp_path, real_path)
         _log(f"Tokens saved to {real_path}")
     except Exception as exc:
         _log(f"Failed to save tokens: {exc}", xbmc.LOGERROR)

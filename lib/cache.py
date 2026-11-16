@@ -450,6 +450,9 @@ class ProgressCache:
         return float(entry.get("resume_time", 0.0))
 
     def set_progress(self, media_id, resume_time, total_time=0.0, watched=False):
+        # The plugin and the service each hold a copy. Re-read before writing
+        # so the service's older copy cannot restore what the plugin cleared.
+        self._data = self._load()
         self._data[media_id] = {
             "resume_time": resume_time,
             "total_time": total_time,

@@ -75,7 +75,9 @@ def _do_request(url, api_key):
             _rate_limit_until = time.time() + retry
             _log(f"HTTP 429 rate limited for {retry}s", xbmc.LOGWARNING)
         elif exc.code == 404:
+            # The service answered: it has no timings for this title.
             _log(f"404 for {url}")
+            return {}
         else:
             _log(f"HTTP {exc.code} for {url}", xbmc.LOGWARNING)
         return None
@@ -205,14 +207,24 @@ def _pick_best_segments_all_types(segments, segment_type):
         if not isinstance(segment, dict):
             continue
 
-        start = segment.get("start_ms")
-        end = segment.get("end_ms")
+        try:
+            start = segment.get("start_ms")
+            end = segment.get("end_ms")
+            start = None if start is None else float(start)
+            end = None if end is None else float(end)
+            confidence = segment.get("confidence")
+            confidence = 0.5 if confidence is None else float(confidence)
+            count = segment.get("submission_count")
+            count = 1.0 if count is None else float(count)
+        except (TypeError, ValueError):
+            # Malformed timing data from a service: ignore this segment.
+            continue
 
         if segment_type in ("intro", "recap"):
             if end is None:
                 continue
             if start is None:
-                start = 0
+                start = 0.0
         elif segment_type in ("credits", "preview"):
             if start is None:
                 continue
@@ -220,9 +232,7 @@ def _pick_best_segments_all_types(segments, segment_type):
         if end is not None and end <= start:
             continue
 
-        confidence = segment.get("confidence") if segment.get("confidence") is not None else 0.5
-        count = segment.get("submission_count", 1)
-        score = float(confidence) + count * 0.001
+        score = confidence + count * 0.001
         valid_segments.append({
             "start_ms": start,
             "end_ms": end,
@@ -252,6 +262,11 @@ def _pick_best_segments_all_types(segments, segment_type):
 
 
 def query_all_segments(tmdb_id=None, imdb_id=None, season=None, episode=None, is_movie=False):
+    """Skip timings by type, {} when there are none, None when no service answered.
+
+    None (network down, rate limited) means the caller may ask again later;
+    {} is a real answer and is final.
+    """
     if ADDON.getSetting("segment_lookups_enabled") != "true":
         return {}
 
@@ -264,17 +279,22 @@ def query_all_segments(tmdb_id=None, imdb_id=None, season=None, episode=None, is
         _log("No TMDb/IMDb identifiers available for segment lookup")
         return {}
     if not _wait_rate_limit():
-        return {}
+        return None
 
     api_key = _get_api_key()
     merged = {segment_type: [] for segment_type in SEGMENT_TYPES}
 
+    answered = False
     for url, mode in urls:
         _log(f"Query ({mode}): {url}")
         data = _do_request(url, api_key)
+        if data is not None:
+            answered = True
         if not data:
             continue
         _merge_source_payload(merged, data, mode)
+    if not answered:
+        return None
 
     results = {}
     for segment_type in SEGMENT_TYPES:

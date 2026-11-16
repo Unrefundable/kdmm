@@ -2,6 +2,7 @@
 
 import json
 import os
+import threading
 import time
 
 import xbmc
@@ -113,23 +114,27 @@ class SeekAccumulator:
         self._direction = 0
         self._count = 0
         self._last_press = 0.0
+        # press() runs on Kodi's notification thread, tick() on the service loop.
+        self._lock = threading.Lock()
 
     def press(self, action):
         direction = {SEEK_FORWARD: 1, SEEK_BACK: -1}.get(action)
         if not direction:
             return
-        if direction != self._direction:
-            self._count = 0
-        self._direction = direction
-        self._count += 1
-        self._last_press = time.time()
+        with self._lock:
+            if direction != self._direction:
+                self._count = 0
+            self._direction = direction
+            self._count += 1
+            self._last_press = time.time()
 
     def tick(self, player):
-        if not self._count or time.time() - self._last_press < SEEK_COMMIT_DELAY_SECONDS:
-            return
-        offset = self._direction * self._count * BIG_SEEK_STEP_SECONDS
-        self._direction = 0
-        self._count = 0
+        with self._lock:
+            if not self._count or time.time() - self._last_press < SEEK_COMMIT_DELAY_SECONDS:
+                return
+            offset = self._direction * self._count * BIG_SEEK_STEP_SECONDS
+            self._direction = 0
+            self._count = 0
         if not player.isPlayingVideo():
             return
         try:

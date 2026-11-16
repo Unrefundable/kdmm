@@ -1,6 +1,6 @@
 import unittest
 
-import kodi_stubs  # noqa: F401
+import kodi_stubs
 import introdb_client as client
 
 
@@ -39,6 +39,47 @@ class PickBestSegmentsTest(unittest.TestCase):
             [seg(None, None), seg(5000, 5000), "junk", seg(0, 10000)], "intro",
         )
         self.assertEqual([(s["start"], s["end"]) for s in picked], [(0.0, 10.0)])
+
+
+    def test_malformed_numbers_drop_the_segment_instead_of_raising(self):
+        bad = [
+            {"start_ms": 0, "end_ms": 20000, "confidence": "high"},
+            {"start_ms": 0, "end_ms": 21000, "confidence": 0.9, "submission_count": None},
+            {"start_ms": "soon", "end_ms": 22000},
+        ]
+        picked = client._pick_best_segments_all_types(bad, "intro")
+        self.assertEqual([(s["start"], s["end"]) for s in picked], [(0.0, 21.0)])
+
+
+class QueryAllSegmentsTest(unittest.TestCase):
+    def setUp(self):
+        kodi_stubs.reset()
+        kodi_stubs.FakeAddon.settings["segment_lookups_enabled"] = "true"
+        self._request = client._do_request
+        self._wait = client._wait_rate_limit
+        client._wait_rate_limit = lambda: True
+        self.addCleanup(setattr, client, "_do_request", self._request)
+        self.addCleanup(setattr, client, "_wait_rate_limit", self._wait)
+
+    def query(self):
+        return client.query_all_segments(tmdb_id="1408", imdb_id="tt0412142", season=1, episode=2)
+
+    def test_none_when_no_service_answered(self):
+        client._do_request = lambda url, key: None
+        self.assertIsNone(self.query())
+
+    def test_none_while_rate_limited(self):
+        client._wait_rate_limit = lambda: False
+        self.assertIsNone(self.query())
+
+    def test_empty_when_a_service_answered_with_nothing(self):
+        client._do_request = lambda url, key: {}
+        self.assertEqual(self.query(), {})
+
+    def test_one_answer_is_enough(self):
+        answers = iter([None, None, {"intro": {"start_ms": 0, "end_ms": 23000, "confidence": 1}}])
+        client._do_request = lambda url, key: next(answers)
+        self.assertEqual([s["end"] for s in self.query()["intro"]], [23.0])
 
 
 if __name__ == "__main__":

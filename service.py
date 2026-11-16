@@ -6,6 +6,7 @@ import os
 import sys
 import threading
 import time
+from urllib.parse import unquote, urlsplit
 
 import xbmc
 import xbmcaddon
@@ -108,12 +109,27 @@ RETURN_TO_DETAILS_WAIT_SECONDS = 5
 STOP_BEFORE_NEXT_TIMEOUT_SECONDS = 8
 CLEANUP_JOIN_TIMEOUT_SECONDS = 5
 FAILED_START_CHECK_SECONDS = 2.0
+SEGMENT_LOOKUP_RETRY_SECONDS = 60
+SEGMENT_LOOKUP_MAX_ATTEMPTS = 3
+# Kodi also reports "ended" when a stream drops part-way. Only an end this
+# close to the full length counts as having watched the item.
+ENDED_MARGIN_SECONDS = 120
 # A skipped segment's button stays away unless the user seeks back to before it.
 SEGMENT_REARM_MARGIN_SECONDS = 2.0
 
 
 def _log(msg, level=xbmc.LOGINFO):
     xbmc.log(f"[KDMM Service] {msg}", level)
+
+
+def _safe_url(url):
+    """Host and file name only: a debrid link's path is a credential."""
+    try:
+        parts = urlsplit(url or "")
+        name = unquote(parts.path.rsplit("/", 1)[-1])
+        return f"{parts.netloc}/…/{name}" if parts.netloc else name
+    except Exception:
+        return "stream"
 
 
 def _setting_bool(key, default=False):
@@ -180,13 +196,19 @@ class SegmentController:
         self._next_episode_checked = False
         self._next_overlay_shown = False
         self._skipped = set()
+        self._segment_attempts = 0
+        self._segment_retry_at = 0.0
 
     def tick(self, player, monitor):
         if not player.isPlayingVideo() or not player._playback_context:
             self.reset()
             return
 
-        filename = player.getPlayingFile() if player.isPlaying() else None
+        try:
+            filename = player.getPlayingFile() if player.isPlaying() else None
+        except RuntimeError:
+            # Playback stopped between the two calls.
+            filename = None
         if not filename:
             return
         filename = filename.split("|")[0]
@@ -195,7 +217,7 @@ class SegmentController:
             self.reset()
             self._current_file = filename
             transition.clear()
-            _log(f"Segment tracking reset for file: {filename}")
+            _log(f"Segment tracking reset for {_safe_url(filename)}")
 
         context = player._playback_context or {}
         if transition.active():
@@ -205,7 +227,11 @@ class SegmentController:
         if total_time <= 0:
             return
 
-        if self._segments is None and _setting_bool("segment_lookups_enabled", True):
+        if (
+            self._segments is None
+            and time.time() >= self._segment_retry_at
+            and _setting_bool("segment_lookups_enabled", True)
+        ):
             self._segments = query_all_segments(
                 tmdb_id=context.get("tmdb_id"),
                 imdb_id=context.get("imdb_id"),
@@ -213,6 +239,14 @@ class SegmentController:
                 episode=context.get("episode"),
                 is_movie=context.get("is_movie", False),
             )
+            if self._segments is None:
+                # No timing service answered. Ask again shortly instead of
+                # going without skip buttons for the whole episode.
+                self._segment_attempts += 1
+                if self._segment_attempts >= SEGMENT_LOOKUP_MAX_ATTEMPTS:
+                    self._segments = {}
+                else:
+                    self._segment_retry_at = time.time() + SEGMENT_LOOKUP_RETRY_SECONDS
 
         all_segments = self._build_enabled_segments(self._segments or {})
 
@@ -388,6 +422,7 @@ class BridgePlayer(xbmc.Player):
         self._was_fullscreen = False
         self._cleanup_threads = []
         self.upnext = None
+        self._failed_start_checking = None
 
     def tick(self):
         if self._current_media_id and self.isPlaying():
@@ -520,6 +555,13 @@ class BridgePlayer(xbmc.Player):
         was_fullscreen = self._was_fullscreen
         self._was_fullscreen = False
         next_episode = None
+        if is_ended and total_time > 0 and total_time - self._last_known_time > ENDED_MARGIN_SECONDS:
+            _log(
+                f"Stream ended at {self._last_known_time:.0f}s of {total_time:.0f}s for {media_id}; "
+                "treating it as stopped, not watched",
+                xbmc.LOGWARNING,
+            )
+            is_ended = False
         should_auto_next = (
             is_ended
             and _setting_bool("auto_play_next_episode", True)
@@ -569,10 +611,17 @@ class BridgePlayer(xbmc.Player):
         before KDMM says anything.
         """
         pending_json = WIN.getProperty(PROP_PENDING_PLAYBACK)
-        if not pending_json:
+        if not pending_json or pending_json == self._failed_start_checking:
             return
+        self._failed_start_checking = pending_json
 
         def _check():
+            try:
+                _check_once()
+            finally:
+                self._failed_start_checking = None
+
+        def _check_once():
             if xbmc.Monitor().waitForAbort(FAILED_START_CHECK_SECONDS):
                 return
             if self.isPlaying() or self._current_media_id:
@@ -839,6 +888,7 @@ class BridgeMonitor(xbmc.Monitor):
         self.prewarm = PrewarmController(_USERDATA_PATH)
         self.next_warm = NextEpisodeWarmer(_USERDATA_PATH)
         self.upnext = UpNextMemory(_USERDATA_PATH)
+        self._step_failures = {}
         self.player.upnext = self.upnext
 
     def onNotification(self, sender, method, data):  # noqa: N802
@@ -852,6 +902,13 @@ class BridgeMonitor(xbmc.Monitor):
     def onSettingsChanged(self):  # noqa: N802
         self._install_keymaps()
         self.prewarm.refresh_settings()
+
+    def _log_step_failure(self, name, exc):
+        # A step that fails every half second would flood the log.
+        now = time.time()
+        if now - self._step_failures.get(name, 0) >= 60:
+            self._step_failures[name] = now
+            _log(f"Service step '{name}' failed: {exc!r}", xbmc.LOGERROR)
 
     def _install_keymaps(self):
         install_keymaps(
@@ -870,18 +927,33 @@ class BridgeMonitor(xbmc.Monitor):
             claim_default_player_once(_USERDATA_PATH)
         except Exception as exc:
             _log(f"claim_default_player_once failed: {exc}", xbmc.LOGWARNING)
-        get_stream_cache_ttl_hours(_USERDATA_PATH)
-        disable_legacy_addon()
-        migrate_choice_settings()
-        self._install_keymaps()
+        startup = [
+            ("cache duration", lambda: get_stream_cache_ttl_hours(_USERDATA_PATH)),
+            ("legacy add-on", disable_legacy_addon),
+            ("settings migration", migrate_choice_settings),
+            ("keymaps", self._install_keymaps),
+        ]
         if _setting_bool("tune_bingie_helper", True):
-            apply_device_tuning()
+            startup.append(("device tuning", apply_device_tuning))
+        for name, step in startup:
+            try:
+                step()
+            except Exception as exc:
+                _log(f"Startup step '{name}' failed: {exc!r}", xbmc.LOGWARNING)
+        steps = (
+            ("player", self.player.tick),
+            ("segments", lambda: self.segment_controller.tick(self.player, self)),
+            ("seek", lambda: self.seek.tick(self.player)),
+            ("prewarm", lambda: self.prewarm.tick(self.player)),
+            ("next warm", lambda: self.next_warm.tick(self.player)),
+        )
         while not self.abortRequested():
-            self.player.tick()
-            self.segment_controller.tick(self.player, self)
-            self.seek.tick(self.player)
-            self.prewarm.tick(self.player)
-            self.next_warm.tick(self.player)
+            for name, step in steps:
+                # One failing step must not end the service for the session.
+                try:
+                    step()
+                except Exception as exc:
+                    self._log_step_failure(name, exc)
             self.waitForAbort(0.5)
         self.prewarm.stop()
         self.next_warm.stop()

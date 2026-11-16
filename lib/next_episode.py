@@ -2,6 +2,7 @@ import json
 import os
 import re
 import sys
+import time
 from urllib.parse import urlencode
 
 import xbmc
@@ -98,6 +99,18 @@ def _tmdb_get_json(path, api_key):
     return response.json() or {}
 
 
+def _without_api_key(exc):
+    return re.sub(r"api_key=[^&\s'\"]+", "api_key=…", str(exc))
+
+
+def _has_aired(episode_item, today=None):
+    """False for an episode TMDb lists with a future, or no, air date."""
+    air_date = str(episode_item.get("air_date") or "").strip()
+    if not air_date:
+        return False
+    return air_date <= (today or time.strftime("%Y-%m-%d"))
+
+
 def _episode_from_tmdb(context, season_number, episode_item):
     episode_number = _extract_int(episode_item.get("episode_number"))
     if not episode_number:
@@ -143,12 +156,15 @@ def _direct_tmdb_next_episode(context, season, episode):
                     continue
                 if season_number == season and episode_number <= episode:
                     continue
+                if not _has_aired(episode_item):
+                    # Listed but not out yet: nothing follows the current episode.
+                    return None
                 next_episode = _episode_from_tmdb(context, season_number, episode_item)
                 if next_episode:
                     _log(f"Using direct TMDb next episode URL for S{season_number}E{episode_number}")
                     return next_episode
     except Exception as exc:
-        _log(f"Direct TMDb next-episode fallback failed: {exc}", xbmc.LOGWARNING)
+        _log(f"Direct TMDb next-episode fallback failed: {_without_api_key(exc)}", xbmc.LOGWARNING)
 
     return None
 

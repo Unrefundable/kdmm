@@ -23,7 +23,7 @@ import os
 import sys
 import threading
 import time
-from urllib.parse import parse_qsl, urlencode
+from urllib.parse import parse_qsl, urlencode, urlsplit
 
 import xbmc
 import xbmcaddon
@@ -115,6 +115,14 @@ def _url_path_lower(url):
     return (url or "").split("|", 1)[0].split("?", 1)[0].lower()
 
 
+def _url_host(url):
+    """Host only: the rest of a debrid link is a credential and stays out of the log."""
+    try:
+        return urlsplit(url or "").netloc or "stream"
+    except Exception:
+        return "stream"
+
+
 def _mimetype_for_url_path(url_path):
     if url_path.endswith(".ts"):
         return "video/mp2t"
@@ -198,7 +206,7 @@ def _play_stream(media_id, url, headers_dict, imdb, tmdb, title, showtitle,
     else:
         WIN.clearProperty(PROP_RESUME_TIME)
 
-    _log(f"Resolving stream to Kodi: {final_url[:80]}…")
+    _log(f"Resolving stream to Kodi: {_url_host(url)}")
     xbmcplugin.setResolvedUrl(ADDON_HANDLE, True, li)
 
 
@@ -660,8 +668,14 @@ def action_play(params):
         chosen_idx = 0
 
     stream = candidates[chosen_idx]
-    unused = candidates[:chosen_idx]
-    _cleanup_candidates(unused)
+    # Every resolved AllDebrid candidate holds a magnet. Release all but the
+    # one about to play (and any that share its magnet, as a season pack does).
+    chosen_key = _provider_state_key(stream)
+    _cleanup_candidates([
+        candidate for index, candidate in enumerate(candidates)
+        if index != chosen_idx
+        and (chosen_key is None or _provider_state_key(candidate) != chosen_key)
+    ])
 
     remaining = [stream]
     playback_label = _playback_label(title, showtitle, season, episode, year)
