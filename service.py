@@ -30,7 +30,7 @@ from details_page import open_details  # noqa: E402
 from device_tuning import apply_device_tuning  # noqa: E402
 from dmm import cleanup_stream_candidate  # noqa: E402
 from introdb_client import query_all_segments  # noqa: E402
-from next_episode import get_next_episode, play_next_episode  # noqa: E402
+from next_episode import get_next_episode, next_episode_from_tmdb, play_next_episode  # noqa: E402
 from next_warm import NextEpisodeWarmer  # noqa: E402
 from playback import decode_playback_context  # noqa: E402
 from prewarm import PrewarmController  # noqa: E402
@@ -38,6 +38,7 @@ import transition  # noqa: E402
 from remote import SeekAccumulator, disable_legacy_addon, install_keymaps  # noqa: E402
 from segment_overlay import show_skip_overlay  # noqa: E402
 from settings_persistence import get_stream_cache_ttl_hours  # noqa: E402
+from upnext import UpNextMemory  # noqa: E402
 from user_messages import describe_playback_failure  # noqa: E402
 
 # ------------------------------------------------------------------ #
@@ -386,6 +387,7 @@ class BridgePlayer(xbmc.Player):
         self._playback_context = {}
         self._was_fullscreen = False
         self._cleanup_threads = []
+        self.upnext = None
 
     def tick(self):
         if self._current_media_id and self.isPlaying():
@@ -547,7 +549,13 @@ class BridgePlayer(xbmc.Player):
             # the new item and must survive this (late) stop callback.
             new_playback_pending = bool(WIN.getProperty(PROP_PENDING_PLAYBACK))
             self._cleanup_current_candidate(include_window=not new_playback_pending)
-            self._save_progress(is_ended=is_ended, clear_window=not new_playback_pending)
+            outcome = self._save_progress(is_ended=is_ended, clear_window=not new_playback_pending)
+            if self.upnext and outcome:
+                known_next = next_episode
+                self.upnext.on_progress_saved(
+                    playback_context, outcome,
+                    lambda context: known_next or next_episode_from_tmdb(context),
+                )
             if next_episode:
                 self._open_next_episode(next_episode)
             elif was_fullscreen and _setting_bool("return_to_details", True):
@@ -787,7 +795,7 @@ class BridgePlayer(xbmc.Player):
     def _save_progress(self, is_ended, clear_window=True):
         media_id = self._current_media_id
         if not media_id:
-            return
+            return None
         self._current_media_id = None
         if clear_window:
             WIN.clearProperty(PROP_PENDING_PLAYBACK)
@@ -800,7 +808,7 @@ class BridgePlayer(xbmc.Player):
 
         if total_time <= 0 or current_time <= 0:
             _log(f"No valid time data for {media_id} – progress not saved", xbmc.LOGWARNING)
-            return
+            return None
 
         near_end = (total_time - current_time) < WATCHED_MARGIN_SECONDS
         if is_ended or near_end:
@@ -808,11 +816,14 @@ class BridgePlayer(xbmc.Player):
             self._progress_cache.set_progress(
                 media_id, 0.0, total_time=total_time, watched=True
             )
-        elif current_time > 5.0:
+            return "watched"
+        if current_time > 5.0:
             _log(f"Saving resume position {current_time:.1f}s / {total_time:.1f}s for {media_id}")
             self._progress_cache.set_progress(
                 media_id, current_time, total_time=total_time, watched=False
             )
+            return "resume"
+        return None
 
 
 # ------------------------------------------------------------------ #
@@ -827,11 +838,16 @@ class BridgeMonitor(xbmc.Monitor):
         self.seek = SeekAccumulator()
         self.prewarm = PrewarmController(_USERDATA_PATH)
         self.next_warm = NextEpisodeWarmer(_USERDATA_PATH)
+        self.upnext = UpNextMemory(_USERDATA_PATH)
+        self.player.upnext = self.upnext
 
     def onNotification(self, sender, method, data):  # noqa: N802
         # Sent by NotifyAll(plugin.video.kdmm,<action>) in kdmm_seek.xml.
+        # upnext_<tmdb id> comes from the skin when a show's page opens.
         if sender == _ADDON_ID and method.startswith("Other."):
-            self.seek.press(method[len("Other."):])
+            action = method[len("Other."):]
+            if not self.upnext.handle_notification(action):
+                self.seek.press(action)
 
     def onSettingsChanged(self):  # noqa: N802
         self._install_keymaps()
@@ -869,6 +885,7 @@ class BridgeMonitor(xbmc.Monitor):
             self.waitForAbort(0.5)
         self.prewarm.stop()
         self.next_warm.stop()
+        self.upnext.stop()
         _log("Service stopped")
 
 
