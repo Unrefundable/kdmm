@@ -185,6 +185,17 @@ def _merge_source_payload(merged, data, source):
         merged[segment_type].extend(data.get(segment_type, []) or [])
 
 
+def _segments_overlap(first, second):
+    """True when two segments share any time; an open end runs to the end."""
+    first_start = first.get("start_ms") or 0
+    second_start = second.get("start_ms") or 0
+    first_end = first.get("end_ms")
+    second_end = second.get("end_ms")
+    first_end = float("inf") if first_end is None else first_end
+    second_end = float("inf") if second_end is None else second_end
+    return first_start < second_end and second_start < first_end
+
+
 def _pick_best_segments_all_types(segments, segment_type):
     if not segments:
         return []
@@ -220,13 +231,17 @@ def _pick_best_segments_all_types(segments, segment_type):
 
     valid_segments.sort(key=lambda item: item["score"], reverse=True)
 
-    seen = set()
+    # The two timing databases often describe the same intro or credits a
+    # second apart. Showing both put a second button on screen right after
+    # the first was pressed, so of any overlapping group only the best-scored
+    # segment is kept. Separate segments of one type (a cold open and a later
+    # title sequence) do not overlap and both survive.
+    kept = []
     results = []
     for segment in valid_segments:
-        key = (segment["start_ms"], segment["end_ms"])
-        if key in seen:
+        if any(_segments_overlap(segment, other) for other in kept):
             continue
-        seen.add(key)
+        kept.append(segment)
         results.append({
             "start": None if segment["start_ms"] is None else segment["start_ms"] / 1000.0,
             "end": None if segment["end_ms"] is None else segment["end_ms"] / 1000.0,

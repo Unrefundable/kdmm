@@ -7,7 +7,7 @@
         <posy>0</posy>
     </coordinates>
     <controls>
-        <control type="group">
+        <control type="group" id="3000">
             <posx>1610</posx>
             <posy>880</posy>
             <width>260</width>

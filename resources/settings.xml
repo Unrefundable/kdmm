@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <settings>
     <category label="Debrid Accounts">
-        <setting id="debrid_provider_order" type="enum" label="Provider priority" values="Real-Debrid first|AllDebrid first" default="0"/>
+        <setting id="debrid_provider_order" type="select" label="Provider priority" values="Real-Debrid first|AllDebrid first" default="Real-Debrid first"/>
         <setting id="rd_api_key" type="text" label="API Key (from real-debrid.com/apitoken)" default="" option="hidden"/>
         <setting id="authorize_rd" type="action" label="Or: Authorize via device code (QR)" action="RunPlugin(plugin://plugin.video.kdmm/?action=authorize_rd)"/>
         <setting id="revoke_rd" type="action" label="Revoke Real-Debrid Authorization" action="RunPlugin(plugin://plugin.video.kdmm/?action=revoke_rd)"/>
@@ -17,13 +17,13 @@
     </category>
     <category label="Quality">
         <setting id="preferred_groups" type="text" label="Preferred release groups (comma-separated)" default="FraMeSToR,Cinephiles,TRITON"/>
-        <setting id="hdr_priority" type="enum" label="HDR preference" values="Dolby Vision|HDR10+|HDR10|Any HDR|SDR only" default="0"/>
-        <setting id="resolution_priority" type="enum" label="Resolution preference" values="4K (2160p)|1080p|720p" default="0"/>
-        <setting id="source_priority" type="enum" label="Source preference" values="Remux|BluRay encode|WEB|Any" default="0"/>
+        <setting id="hdr_priority" type="select" label="HDR preference" values="Dolby Vision|HDR10+|HDR10|Any HDR|SDR only" default="Dolby Vision"/>
+        <setting id="resolution_priority" type="select" label="Resolution preference" values="4K (2160p)|1080p|720p" default="4K (2160p)"/>
+        <setting id="source_priority" type="select" label="Source preference" values="Remux|BluRay encode|WEB|Any" default="Remux"/>
         <setting id="probe_av1_codec" type="bool" label="Probe resolved file metadata for AV1" default="true"/>
-        <setting id="preferred_audio_language" type="enum" label="Preferred audio language" values="Any|English|Japanese|Korean|Spanish|French|German|Italian|Portuguese|Chinese|Hindi|Arabic|Russian|Dutch|Polish|Swedish|Danish|Norwegian|Finnish|Turkish" default="0"/>
+        <setting id="preferred_audio_language" type="select" label="Preferred audio language" values="Any|English|Japanese|Korean|Spanish|French|German|Italian|Portuguese|Chinese|Hindi|Arabic|Russian|Dutch|Polish|Swedish|Danish|Norwegian|Finnish|Turkish" default="Any"/>
         <setting id="strict_title_matching" type="bool" label="Strict title matching (prefer no play over wrong title)" default="false"/>
-        <setting id="tv_pack_preference" type="enum" label="TV pack preference" values="Prefer complete packs|Balanced|Allow singles" default="0"/>
+        <setting id="tv_pack_preference" type="select" label="TV pack preference" values="Prefer complete packs|Balanced|Allow singles" default="Prefer complete packs"/>
     </category>
     <category label="Skip &amp; Next">
         <setting id="segment_lookups_enabled" type="bool" label="Use IntroDB.app and TheIntroDB timings" default="true"/>
@@ -33,6 +33,7 @@
         <setting id="enable_preview_button" type="bool" label="Show Skip Preview button" default="true"/>
         <setting id="enable_next_episode_button" type="bool" label="Show Play Next Episode button" default="true"/>
         <setting id="auto_play_next_episode" type="bool" label="Automatically play next episode when episode ends" default="true"/>
+        <setting id="warm_next_episode" type="bool" label="Find the next episode's stream while you watch (faster Next Episode)" default="true"/>
         <setting id="skip_offset_seconds" type="number" label="Skip offset (seconds)" default="2"/>
         <setting id="introdb_api_key" type="text" label="IntroDB API key (optional)" default="" option="hidden"/>
         <setting id="segment_debug_logging" type="bool" label="Verbose IntroDB/skip logging" default="false"/>

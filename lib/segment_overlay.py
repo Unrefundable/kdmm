@@ -14,13 +14,14 @@ ADDON = xbmcaddon.Addon()
 ADDON_PATH = ADDON.getAddonInfo("path")
 WIN = xbmcgui.Window(10000)
 OVERLAY_RES = "1080i"
+GROUP_ID = 3000
 BUTTON_ID = 3001
 BG_IMAGE_SHADOW = 3003
 BG_IMAGE_FILL = 3004
 ACTION_SELECT = 7
 ACTION_PREVIOUS_MENU = 10
 ACTION_BACK = 92
-POLL_INTERVAL = 0.5
+POLL_INTERVAL = 0.25
 DISPLAY_DURATION = 5.0
 DISPLAY_DURATION_BY_SEGMENT = {
     "next_episode": 25.0,
@@ -31,6 +32,15 @@ def _texture_path():
     return xbmcvfs.translatePath(os.path.join(
         ADDON_PATH, "resources", "skins", "default", OVERLAY_RES, "rounded_rect.png"
     ))
+
+
+def _playing_file(player):
+    try:
+        if player is not None and player.isPlaying():
+            return player.getPlayingFile().split("|")[0]
+    except Exception:
+        pass
+    return ""
 
 
 class SkipOverlay(xbmcgui.WindowXMLDialog):
@@ -50,6 +60,7 @@ class SkipOverlay(xbmcgui.WindowXMLDialog):
         self._closed = False
         self._lock = threading.Lock()
         self._display_deadline = None
+        self._file_at_open = _playing_file(player)
 
     @property
     def skip_pressed(self):
@@ -115,10 +126,7 @@ class SkipOverlay(xbmcgui.WindowXMLDialog):
             self._closed = True
         if self._segment_type == "next_episode":
             transition.begin()
-            try:
-                self.getControl(BUTTON_ID).setVisible(False)
-            except Exception:
-                pass
+        self._hide()
         if self._callback:
             try:
                 self._callback()
@@ -136,7 +144,11 @@ class SkipOverlay(xbmcgui.WindowXMLDialog):
                 self._close_from_thread()
                 return
             try:
-                if self._segment_type == "next_episode" and transition.active():
+                if transition.active():
+                    self._close_from_thread()
+                    return
+                if _playing_file(self._player) != self._file_at_open:
+                    # A different item is playing; this button belongs to the old one.
                     self._close_from_thread()
                     return
                 if self._display_deadline is not None and time.time() >= self._display_deadline:
@@ -153,11 +165,24 @@ class SkipOverlay(xbmcgui.WindowXMLDialog):
             except Exception:
                 pass
 
+    def _hide(self):
+        """Take the button off screen at once.
+
+        close() only returns after Kodi has run the close animation and torn
+        the window down, which takes a second or more on a busy GUI thread
+        (a seek, or the switch back to the menu when playback stops).
+        """
+        try:
+            self.getControl(GROUP_ID).setVisible(False)
+        except Exception:
+            pass
+
     def _close_from_thread(self):
         with self._lock:
             if self._closed:
                 return
             self._closed = True
+        self._hide()
         try:
             self.close()
         except Exception:
@@ -166,6 +191,7 @@ class SkipOverlay(xbmcgui.WindowXMLDialog):
     def _dismiss_main_thread(self):
         with self._lock:
             self._closed = True
+        self._hide()
         try:
             self.close()
         except Exception:

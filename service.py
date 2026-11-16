@@ -24,12 +24,14 @@ _USERDATA_PATH = xbmcvfs.translatePath(
 sys.path.insert(0, os.path.join(_ADDON_PATH, "lib"))
 
 from cache import ProgressCache   # noqa: E402
+from choices import migrate_choice_settings  # noqa: E402
 from default_player import claim_default_player_once  # noqa: E402
 from details_page import open_details  # noqa: E402
 from device_tuning import apply_device_tuning  # noqa: E402
 from dmm import cleanup_stream_candidate  # noqa: E402
 from introdb_client import query_all_segments  # noqa: E402
 from next_episode import get_next_episode, play_next_episode  # noqa: E402
+from next_warm import NextEpisodeWarmer  # noqa: E402
 from playback import decode_playback_context  # noqa: E402
 from prewarm import PrewarmController  # noqa: E402
 import transition  # noqa: E402
@@ -104,6 +106,9 @@ POST_CREDITS_SCENE_MIN_SECONDS = 20
 RETURN_TO_DETAILS_WAIT_SECONDS = 5
 STOP_BEFORE_NEXT_TIMEOUT_SECONDS = 8
 CLEANUP_JOIN_TIMEOUT_SECONDS = 5
+FAILED_START_CHECK_SECONDS = 2.0
+# A skipped segment's button stays away unless the user seeks back to before it.
+SEGMENT_REARM_MARGIN_SECONDS = 2.0
 
 
 def _log(msg, level=xbmc.LOGINFO):
@@ -173,6 +178,7 @@ class SegmentController:
         self._next_episode = None
         self._next_episode_checked = False
         self._next_overlay_shown = False
+        self._skipped = set()
 
     def tick(self, player, monitor):
         if not player.isPlayingVideo() or not player._playback_context:
@@ -223,6 +229,12 @@ class SegmentController:
                 continue
 
             segment_key = f"{segment_type}_{idx}"
+            if segment_key in self._skipped:
+                # Right after a skip Kodi can still report the old position
+                # for a moment; that must not bring the button back.
+                if current_time >= api_start - SEGMENT_REARM_MARGIN_SECONDS:
+                    continue
+                self._skipped.discard(segment_key)
             if not _should_show_segment_button(self._processed, segment_key, current_time, api_start, effective_end):
                 continue
 
@@ -244,7 +256,9 @@ class SegmentController:
                 if pressed:
                     _log(f"Opening next episode S{next_episode['season']}E{next_episode['episode']}")
                     player.switch_to_episode(next_episode, monitor)
-                continue
+                # The overlay blocked this loop, so the position read above
+                # is stale. Look again on the next tick.
+                return
 
             pressed = show_skip_overlay(
                 segment_end=effective_end,
@@ -253,7 +267,18 @@ class SegmentController:
                 segment_type=segment_type,
             )
             if pressed:
+                self._skipped.add(segment_key)
+                # Any other segment of this type that covers the same stretch
+                # has been dealt with by this press too.
+                for other_idx, other in enumerate(all_segments):
+                    if other["type"] != segment_type or other_idx == idx:
+                        continue
+                    other_start = other.get("start") or 0.0
+                    other_end = total_time if other.get("end") is None else other["end"]
+                    if other_start < effective_end and api_start < other_end:
+                        self._skipped.add(f"{segment_type}_{other_idx}")
                 self._seek_past_segment(player, effective_end, segment_type, total_time)
+            return
 
         if _setting_bool("enable_next_episode_button", True) and not context.get("is_movie", False):
             self._show_fallback_next_episode(player, monitor, context, current_time, total_time)
@@ -485,6 +510,7 @@ class BridgePlayer(xbmc.Player):
     def _handle_playback_stop(self, is_ended):
         media_id = self._current_media_id
         if not media_id:
+            self._check_failed_start_soon()
             return
 
         playback_context = dict(self._playback_context or {})
@@ -526,6 +552,47 @@ class BridgePlayer(xbmc.Player):
                 self._open_next_episode(next_episode)
             elif was_fullscreen and _setting_bool("return_to_details", True):
                 self._return_to_details(playback_context)
+
+    def _check_failed_start_soon(self):
+        """Kodi stopped without ever starting the stream KDMM resolved.
+
+        When Kodi cannot open a resolved URL it reports a plain stop, not an
+        error. Without this the user waits out the 30-second start timeout
+        before KDMM says anything.
+        """
+        pending_json = WIN.getProperty(PROP_PENDING_PLAYBACK)
+        if not pending_json:
+            return
+
+        def _check():
+            if xbmc.Monitor().waitForAbort(FAILED_START_CHECK_SECONDS):
+                return
+            if self.isPlaying() or self._current_media_id:
+                return
+            # Unchanged means no new play request replaced it meanwhile.
+            if WIN.getProperty(PROP_PENDING_PLAYBACK) != pending_json:
+                return
+            try:
+                pending = json.loads(pending_json)
+            except Exception:
+                WIN.clearProperty(PROP_PENDING_PLAYBACK)
+                return
+            media_id = pending.get("media_id")
+            url = (pending.get("url") or "").split("|")[0]
+            if not media_id:
+                return
+            if url:
+                self._tried_urls.add(url)
+            transition.clear()
+            _log(f"Kodi could not open the stream for {media_id}", xbmc.LOGWARNING)
+            self._clear_failed_stream(
+                media_id,
+                "Kodi could not open this stream. KDMM kept the cached source; retry playback to refresh the link.",
+                failed_candidate=self._candidate_for_url(url),
+                failed_url=url,
+            )
+
+        threading.Thread(target=_check, daemon=True).start()
 
     def switch_to_episode(self, next_episode, monitor):
         """Stop the current stream completely, then open the next episode.
@@ -759,6 +826,7 @@ class BridgeMonitor(xbmc.Monitor):
         self.segment_controller = SegmentController()
         self.seek = SeekAccumulator()
         self.prewarm = PrewarmController(_USERDATA_PATH)
+        self.next_warm = NextEpisodeWarmer(_USERDATA_PATH)
 
     def onNotification(self, sender, method, data):  # noqa: N802
         # Sent by NotifyAll(plugin.video.kdmm,<action>) in kdmm_seek.xml.
@@ -788,6 +856,7 @@ class BridgeMonitor(xbmc.Monitor):
             _log(f"claim_default_player_once failed: {exc}", xbmc.LOGWARNING)
         get_stream_cache_ttl_hours(_USERDATA_PATH)
         disable_legacy_addon()
+        migrate_choice_settings()
         self._install_keymaps()
         if _setting_bool("tune_bingie_helper", True):
             apply_device_tuning()
@@ -796,8 +865,10 @@ class BridgeMonitor(xbmc.Monitor):
             self.segment_controller.tick(self.player, self)
             self.seek.tick(self.player)
             self.prewarm.tick(self.player)
+            self.next_warm.tick(self.player)
             self.waitForAbort(0.5)
         self.prewarm.stop()
+        self.next_warm.stop()
         _log("Service stopped")
 
 

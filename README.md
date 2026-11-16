@@ -54,7 +54,7 @@ It also covers what happens around playback: resume and watched progress, skip b
 - **Automatic fallback.** If a stream fails to start, KDMM moves on to the next candidate.
 - **Resume and watched progress.** Positions are saved locally, with resume and play-from-beginning options.
 - **Skip buttons.** Skip Intro, Recap, Credits and Preview buttons, using timings from IntroDB.app and TheIntroDB.
-- **Next episode.** A Play Next Episode button, plus optional automatic playback when an episode ends.
+- **Next episode.** A Play Next Episode button, plus optional automatic playback when an episode ends. A couple of minutes into an episode KDMM already looks up the next one in the background, so the switch does not wait on a search.
 - **Back to the title.** When playback stops or ends, KDMM opens the movie's or show's page, built by TMDb Bingie Helper so it is always the title you were watching.
 - **Clean up.** Provider-owned stream state is removed after playback ends or fails.
 

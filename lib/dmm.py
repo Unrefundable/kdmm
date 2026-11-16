@@ -21,6 +21,7 @@ import math
 import re
 import sys
 import os
+import threading
 import time as _time
 import unicodedata
 
@@ -29,6 +30,7 @@ import xbmcaddon
 import xbmcgui
 import xbmcvfs
 
+from choices import choice_index
 from user_messages import describe_exception, is_network_exception
 
 _DMM_BASE = "https://debridmediamanager.com"
@@ -278,7 +280,53 @@ def _av1_text_rank(value):
     return 1 if is_av1_stream(value) else 0
 
 
+_SAMPLE_CACHE_MAX_URLS = 3
+_SAMPLE_CACHE_MAX_AGE_SECONDS = 60
+_sample_cache_lock = threading.Lock()
+_sample_cache = {}  # url -> {"at": time, "ranges": {(start, size): bytes}, "length": int}
+
+
+def _sample_cache_entry(url, create=False):
+    """Caller holds _sample_cache_lock."""
+    now = _time.time()
+    for key in [k for k, v in _sample_cache.items() if now - v["at"] > _SAMPLE_CACHE_MAX_AGE_SECONDS]:
+        del _sample_cache[key]
+    entry = _sample_cache.get(url)
+    if entry is None and create:
+        while len(_sample_cache) >= _SAMPLE_CACHE_MAX_URLS:
+            del _sample_cache[min(_sample_cache, key=lambda k: _sample_cache[k]["at"])]
+        entry = _sample_cache[url] = {"at": now, "ranges": {}, "length": None}
+    return entry
+
+
+def _forget_url_samples(url):
+    with _sample_cache_lock:
+        _sample_cache.pop(url, None)
+
+
 def _read_url_sample(url, headers=None, start=0, size=_CODEC_PROBE_BYTES, timeout=4):
+    """Read a byte range, reusing one a probe of the same URL just fetched.
+
+    The codec, episode and audio probes each sample the same start and end of
+    a file. Without sharing, one resolve downloads those megabytes three times.
+    """
+    if not url or size <= 0:
+        return b""
+    with _sample_cache_lock:
+        entry = _sample_cache_entry(url)
+        if entry:
+            for (have_start, have_size), data in entry["ranges"].items():
+                offset = start - have_start
+                if offset >= 0 and start + size <= have_start + have_size and len(data) >= offset + size:
+                    return data[offset:offset + size]
+    data = _fetch_url_sample(url, headers, start=start, size=size, timeout=timeout)
+    if len(data) == size:
+        with _sample_cache_lock:
+            _sample_cache_entry(url, create=True)["ranges"][(start, size)] = data
+    return data
+
+
+def _fetch_url_sample(url, headers=None, start=0, size=_CODEC_PROBE_BYTES, timeout=4):
     if not url or size <= 0:
         return b""
     req_headers = dict(headers or {})
@@ -312,6 +360,18 @@ def _read_url_sample(url, headers=None, start=0, size=_CODEC_PROBE_BYTES, timeou
 
 
 def _remote_content_length(url, headers=None, timeout=4):
+    with _sample_cache_lock:
+        entry = _sample_cache_entry(url)
+        if entry and entry["length"] is not None:
+            return entry["length"]
+    length = _fetch_remote_content_length(url, headers, timeout=timeout)
+    if length >= 0:
+        with _sample_cache_lock:
+            _sample_cache_entry(url, create=True)["length"] = length
+    return length
+
+
+def _fetch_remote_content_length(url, headers=None, timeout=4):
     try:
         resp = _get_session().head(
             url, headers=headers or {}, timeout=timeout, allow_redirects=True
@@ -1426,20 +1486,20 @@ def _get_quality_preferences():
     preferred_groups = [g.strip().lower() for g in groups_raw.split(",") if g.strip()]
 
     # HDR preference (0=DV, 1=HDR10+, 2=HDR10, 3=Any HDR, 4=SDR only)
-    hdr_pref = int(addon.getSetting("hdr_priority") or "0")
+    hdr_pref = choice_index("hdr_priority", 0, addon)
 
     # Resolution preference (0=4K, 1=1080p, 2=720p)
-    res_pref = int(addon.getSetting("resolution_priority") or "0")
+    res_pref = choice_index("resolution_priority", 0, addon)
 
     # Source preference (0=Remux, 1=BluRay, 2=WEB, 3=Any)
-    src_pref = int(addon.getSetting("source_priority") or "0")
+    src_pref = choice_index("source_priority", 0, addon)
 
     return preferred_groups, hdr_pref, res_pref, src_pref
 
 
 def _get_matching_preferences():
     strict_matching = _setting_bool("strict_title_matching", False)
-    tv_pack_preference = _setting_int("tv_pack_preference", 0)
+    tv_pack_preference = choice_index("tv_pack_preference", 0)
     return strict_matching, tv_pack_preference
 
 
@@ -1602,7 +1662,7 @@ def _get_debrid_accounts():
     if ad_token:
         accounts.append({"provider": _PROVIDER_AD, "token": ad_token})
 
-    if _setting_int("debrid_provider_order", 0) == 1:
+    if choice_index("debrid_provider_order", 0) == 1:
         accounts.sort(key=lambda item: 0 if item["provider"] == _PROVIDER_AD else 1)
     else:
         accounts.sort(key=lambda item: 0 if item["provider"] == _PROVIDER_RD else 1)
@@ -2455,6 +2515,7 @@ def _try_resolve_one(candidate, api_token, season, episode, cancel_event,
 
         audio_preference = _preferred_audio_language()
         audio_probe = _probe_audio_language_stream(url, preferred=audio_preference)
+        _forget_url_samples(url)
         if audio_probe is False:
             _log(
                 f"{h8} resolved stream skipped; no preferred audio language "
@@ -2642,6 +2703,7 @@ def _try_resolve_one_ad(candidate, api_token, season, episode, cancel_event,
 
         audio_preference = _preferred_audio_language()
         audio_probe = _probe_audio_language_stream(url, preferred=audio_preference)
+        _forget_url_samples(url)
         if audio_probe is False:
             _log(
                 f"{h8} resolved AD stream skipped; no preferred audio language "

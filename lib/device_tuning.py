@@ -16,6 +16,11 @@ from bingie_helper import BINGIE_HELPER_ID
 
 _BINGIE_THREAD_PATH = "special://home/addons/script.module.bingie/resources/modules/bingie/thread.py"
 _BINGIE_THREAD_MAX = 12
+_HELPER_DATABASE_PATH = (
+    f"special://home/addons/{BINGIE_HELPER_ID}/resources/tmdbbingiehelper/lib/files/database.py"
+)
+_HELPER_PRAGMA_ANCHOR = 'connection.execute("PRAGMA foreign_keys=ON")'
+_HELPER_PRAGMA_MMAP_OFF = 'connection.execute("PRAGMA mmap_size=0")'
 
 # A Mac has the CPU for 260-item Trakt lists; an Amlogic box does not.
 # Two Trakt pages (40 items) still fill the skin's 25-item widgets.
@@ -57,6 +62,40 @@ def patch_bingie_thread_limit():
             _log(f"Bingie ParallelThread limit set to {_BINGIE_THREAD_MAX}")
     except Exception as exc:
         _log(f"Could not patch Bingie thread limit: {exc}", xbmc.LOGWARNING)
+
+
+def patch_helper_database_mmap():
+    """Stop the helper's SQLite connections memory-mapping its databases.
+
+    The helper never closes its connections, and each one maps the whole
+    database (about 66 MB for ItemBuilder.db). On a 32-bit Kodi a few hours
+    of browsing fills the address space; Kodi then cannot allocate its video
+    cache and every stream fails to open until Kodi is restarted.
+    """
+    path = xbmcvfs.translatePath(_HELPER_DATABASE_PATH)
+    if not os.path.exists(path):
+        return False
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            raw = fh.read()
+        if _HELPER_PRAGMA_MMAP_OFF in raw:
+            return False
+        if _HELPER_PRAGMA_ANCHOR not in raw:
+            _log("Helper database code has changed; mmap patch not applied", xbmc.LOGWARNING)
+            return False
+        indent = raw[raw.rfind("\n", 0, raw.index(_HELPER_PRAGMA_ANCHOR)) + 1:raw.index(_HELPER_PRAGMA_ANCHOR)]
+        updated = raw.replace(
+            _HELPER_PRAGMA_ANCHOR,
+            f"{_HELPER_PRAGMA_ANCHOR}\n{indent}{_HELPER_PRAGMA_MMAP_OFF}",
+            1,
+        )
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(updated)
+        _log("Helper databases no longer memory-mapped (takes effect after Kodi restarts)")
+        return True
+    except Exception as exc:
+        _log(f"Could not patch helper database mmap: {exc}", xbmc.LOGWARNING)
+        return False
 
 
 def _patch_helper_pagemulti_maximum():
@@ -124,5 +163,6 @@ def raise_file_limit():
 
 def apply_device_tuning():
     patch_bingie_thread_limit()
+    patch_helper_database_mmap()
     tune_bingie_helper()
     raise_file_limit()

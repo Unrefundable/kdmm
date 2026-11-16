@@ -42,6 +42,7 @@ rsync -a \
   --exclude='.staging_addon_zip/' \
   --exclude='.log_extract/' \
   --exclude='docs/' \
+  --exclude='tests/' \
   --exclude='plugin.video.kdmm/' \
   --exclude='__pycache__/' \
   --exclude='*.pyc' \
