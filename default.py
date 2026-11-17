@@ -82,6 +82,7 @@ PROP_RESUME_TIME = "kdmm.resume_time"
 PROP_CANDIDATES = "kdmm.candidates"   # JSON list of selected stream candidates
 PROP_PLAYBACK_CONTEXT = "kdmm.playback_context"
 PROP_PENDING_PLAYBACK = "kdmm.pending_playback"
+PROP_PREPARE_DETAILS = "kdmm.prepare_details"
 
 
 def _log(msg, level=xbmc.LOGINFO):
@@ -435,6 +436,12 @@ def action_play(params):
             xbmcgui.NOTIFICATION_ERROR,
         )
         return
+
+    # The service builds the title page from this while the stream is looked
+    # up, so it is ready the moment playback stops.
+    WIN.setProperty(PROP_PREPARE_DETAILS, json.dumps({
+        "tmdb_id": tmdb, "imdb_id": imdb, "is_movie": catalog_type == "movie",
+    }))
 
     ttl_hours = get_stream_cache_ttl_hours(_USERDATA_PATH)
     stream_cache = StreamCache(_USERDATA_PATH, ttl=ttl_hours * 3600)

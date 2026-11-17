@@ -27,7 +27,7 @@ sys.path.insert(0, os.path.join(_ADDON_PATH, "lib"))
 from cache import ProgressCache   # noqa: E402
 from choices import migrate_choice_settings  # noqa: E402
 from default_player import claim_default_player_once  # noqa: E402
-from details_page import open_details  # noqa: E402
+from details_page import open_details, prepare_details  # noqa: E402
 from device_tuning import apply_device_tuning  # noqa: E402
 from dmm import cleanup_stream_candidate  # noqa: E402
 from introdb_client import query_all_segments  # noqa: E402
@@ -98,6 +98,7 @@ PROP_RESUME_TIME = "kdmm.resume_time"
 PROP_CANDIDATES = "kdmm.candidates"
 PROP_PLAYBACK_CONTEXT = "kdmm.playback_context"
 PROP_PENDING_PLAYBACK = "kdmm.pending_playback"
+PROP_PREPARE_DETAILS = "kdmm.prepare_details"
 
 WATCHED_MARGIN_SECONDS = 60
 MIN_CONTENT_SECONDS = 60
@@ -106,6 +107,11 @@ SEGMENT_END_MARGIN_SECONDS = 0.25
 NEXT_EPISODE_FALLBACK_SECONDS = 45
 POST_CREDITS_SCENE_MIN_SECONDS = 20
 RETURN_TO_DETAILS_WAIT_SECONDS = 5
+# A list of the show's episodes or seasons: the user came from the title page
+# to here, so opening the page again would stack it on top of its own list.
+EPISODE_LIST_VISIBLE = (
+    "Window.IsActive(videos) + [Container.Content(episodes) | Container.Content(seasons)]"
+)
 STOP_BEFORE_NEXT_TIMEOUT_SECONDS = 8
 CLEANUP_JOIN_TIMEOUT_SECONDS = 5
 FAILED_START_CHECK_SECONDS = 2.0
@@ -436,7 +442,22 @@ class BridgePlayer(xbmc.Player):
             except Exception:
                 pass
             self._was_fullscreen = xbmc.getCondVisibility("Window.IsActive(fullscreenvideo)")
+        self._prepare_requested_details()
         self._check_pending_playback_start()
+
+    def _prepare_requested_details(self):
+        """Build the title page as soon as a play request names its title.
+
+        The request is written when Play is pressed, so the page is built
+        while KDMM is still looking for a stream and nothing is decoding,
+        not during playback.
+        """
+        raw = WIN.getProperty(PROP_PREPARE_DETAILS)
+        if not raw:
+            return
+        WIN.clearProperty(PROP_PREPARE_DETAILS)
+        if _setting_bool("return_to_details", True):
+            prepare_details(decode_playback_context(raw))
 
     def _check_pending_playback_start(self):
         pending_json = WIN.getProperty(PROP_PENDING_PLAYBACK)
@@ -699,8 +720,12 @@ class BridgePlayer(xbmc.Player):
 
     def _return_to_details(self, context):
         def _open():
-            if self._wait_for_menu():
-                open_details(context)
+            if not self._wait_for_menu():
+                return
+            if not context.get("is_movie") and xbmc.getCondVisibility(EPISODE_LIST_VISIBLE):
+                _log("Back on the episode list; not opening the title page over it")
+                return
+            open_details(context)
 
         threading.Thread(target=_open, daemon=True).start()
 

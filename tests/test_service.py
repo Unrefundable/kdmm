@@ -220,6 +220,140 @@ class StopHandlingTest(unittest.TestCase):
         self.assertEqual(self.outcomes, ["watched"])
 
 
+class ReturnToDetailsTest(unittest.TestCase):
+    """Which window Kodi returned to decides whether the title page opens."""
+
+    EPISODE = {"tmdb_id": "9", "season": 1, "episode": 4, "is_movie": False}
+
+    def setUp(self):
+        kodi_stubs.reset()
+        self.player = service.BridgePlayer.__new__(service.BridgePlayer)
+        self.player.isPlayingVideo = lambda: False
+        self.visible = set()
+        self._cond = service.xbmc.getCondVisibility
+        service.xbmc.getCondVisibility = lambda cond: cond in self.visible
+        self.addCleanup(setattr, service.xbmc, "getCondVisibility", self._cond)
+        self.opened = []
+        self._open = service.open_details
+        service.open_details = self.opened.append
+        self.addCleanup(setattr, service, "open_details", self._open)
+
+    def _return(self, context):
+        threads = set(threading.enumerate())
+        self.player._return_to_details(context)
+        for thread in set(threading.enumerate()) - threads:
+            thread.join(2)
+
+    def test_the_title_page_opens_over_the_home_screen(self):
+        self._return(self.EPISODE)
+        self.assertEqual(self.opened, [self.EPISODE])
+
+    def test_the_title_page_stays_closed_over_the_episode_list(self):
+        self.visible.add(service.EPISODE_LIST_VISIBLE)
+        self._return(self.EPISODE)
+        self.assertEqual(self.opened, [])
+
+    def test_a_movie_still_opens_its_page(self):
+        self.visible.add(service.EPISODE_LIST_VISIBLE)
+        movie = {"tmdb_id": "5", "is_movie": True}
+        self._return(movie)
+        self.assertEqual(self.opened, [movie])
+
+
+class PrepareOnPlayRequestTest(unittest.TestCase):
+    """A play request has its title page built before the stream starts."""
+
+    REQUEST = {"tmdb_id": "9", "imdb_id": "tt1", "is_movie": False}
+
+    def setUp(self):
+        kodi_stubs.reset()
+        self.player = service.BridgePlayer.__new__(service.BridgePlayer)
+        self.prepared = []
+        self._prepare = service.prepare_details
+        service.prepare_details = self.prepared.append
+        self.addCleanup(setattr, service, "prepare_details", self._prepare)
+
+    def test_the_requested_title_is_prepared_once(self):
+        service.WIN.setProperty(service.PROP_PREPARE_DETAILS, json.dumps(self.REQUEST))
+        self.player._prepare_requested_details()
+        self.player._prepare_requested_details()
+        self.assertEqual(self.prepared, [self.REQUEST])
+
+    def test_nothing_is_prepared_without_a_request(self):
+        self.player._prepare_requested_details()
+        self.assertEqual(self.prepared, [])
+
+    def test_nothing_is_prepared_when_the_page_is_switched_off(self):
+        kodi_stubs.FakeAddon.settings["return_to_details"] = "false"
+        service.WIN.setProperty(service.PROP_PREPARE_DETAILS, json.dumps(self.REQUEST))
+        self.player._prepare_requested_details()
+        self.assertEqual(self.prepared, [])
+        self.assertEqual(service.WIN.getProperty(service.PROP_PREPARE_DETAILS), "")
+
+
+class PreparedDetailsTest(unittest.TestCase):
+    """The title page is built during playback and shown without a rebuild."""
+
+    SHOW = {"tmdb_id": "9", "is_movie": False}
+
+    def setUp(self):
+        kodi_stubs.reset()
+        import details_page
+        self.details = details_page
+        details_page._prepared = None
+        self.built = []
+        self._import = details_page._import_get_listitem
+        details_page._import_get_listitem = lambda: self._get_listitem
+        self.addCleanup(setattr, details_page, "_import_get_listitem", self._import)
+        self.shown = []
+        dialog = type("Dialog", (), {"info": lambda _s, item: self.shown.append(item)})
+        self._dialog = details_page.xbmcgui.Dialog
+        details_page.xbmcgui.Dialog = dialog
+        self.addCleanup(setattr, details_page.xbmcgui, "Dialog", self._dialog)
+
+    def _get_listitem(self, path):
+        self.built.append(path)
+        return f"item {len(self.built)}"
+
+    def _wait_prepared(self):
+        self.assertTrue(self.details._prepared.done.wait(2))
+
+    def test_stopping_shows_the_page_built_during_playback(self):
+        self.assertTrue(self.details.prepare_details(self.SHOW))
+        self._wait_prepared()
+        self.assertTrue(self.details.open_details(self.SHOW))
+        self.assertEqual(self.shown, ["item 1"])
+        self.assertEqual(len(self.built), 1)
+
+    def test_preparing_twice_builds_once(self):
+        self.details.prepare_details(self.SHOW)
+        self.details.prepare_details(self.SHOW)
+        self._wait_prepared()
+        self.assertEqual(len(self.built), 1)
+
+    def test_a_page_prepared_for_another_title_is_not_shown(self):
+        self.details.prepare_details({"tmdb_id": "7", "is_movie": True})
+        self._wait_prepared()
+        self.details.open_details(self.SHOW)
+        self.assertEqual(self.shown, ["item 2"])
+        self.assertIn("tmdb_id=9", self.built[1])
+
+    def test_without_a_prepared_page_it_is_built_on_stop(self):
+        self.assertTrue(self.details.open_details(self.SHOW))
+        self.assertEqual(self.shown, ["item 1"])
+
+    def test_a_prepared_page_is_shown_only_once(self):
+        self.details.prepare_details(self.SHOW)
+        self._wait_prepared()
+        self.details.open_details(self.SHOW)
+        self.details.open_details(self.SHOW)
+        self.assertEqual(self.shown, ["item 1", "item 2"])
+
+    def test_a_context_without_ids_is_not_prepared(self):
+        self.assertFalse(self.details.prepare_details({"is_movie": True}))
+        self.assertEqual(self.built, [])
+
+
 class SafeUrlTest(unittest.TestCase):
     def test_the_link_path_stays_out_of_the_log(self):
         text = service._safe_url("https://c5.debrid.it/dl/SECRETTOKEN/House.S01E10.mkv")
