@@ -45,5 +45,50 @@ class HelperDatabaseMmapPatchTest(unittest.TestCase):
         self.assertFalse(device_tuning.patch_helper_database_mmap())
 
 
+SCACHE_SOURCE = '''class SimpleCache:
+    def _set_pragmas(self, connection):
+        connection.execute("PRAGMA synchronous=NORMAL")
+        connection.execute("PRAGMA journal_mode=WAL")
+        return connection
+'''
+
+
+class BingieCacheMmapPatchTest(unittest.TestCase):
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        self.path = Path(self._dir.name) / "scache.py"
+        self._original = device_tuning._BINGIE_SCACHE_PATH
+        device_tuning._BINGIE_SCACHE_PATH = str(self.path)
+        self.addCleanup(setattr, device_tuning, "_BINGIE_SCACHE_PATH", self._original)
+
+    def test_adds_mmap_off_after_journal_mode(self):
+        self.path.write_text(SCACHE_SOURCE, encoding="utf-8")
+        self.assertTrue(device_tuning.patch_bingie_cache_mmap())
+        patched = self.path.read_text(encoding="utf-8")
+        self.assertIn(
+            '        connection.execute("PRAGMA journal_mode=WAL")\n'
+            '        connection.execute("PRAGMA mmap_size=0")\n'
+            '        return connection',
+            patched,
+        )
+        compile(patched, "scache.py", "exec")
+
+    def test_second_run_changes_nothing(self):
+        self.path.write_text(SCACHE_SOURCE, encoding="utf-8")
+        device_tuning.patch_bingie_cache_mmap()
+        once = self.path.read_text(encoding="utf-8")
+        self.assertFalse(device_tuning.patch_bingie_cache_mmap())
+        self.assertEqual(self.path.read_text(encoding="utf-8"), once)
+
+    def test_ambiguous_anchor_is_left_alone(self):
+        self.path.write_text(SCACHE_SOURCE + SCACHE_SOURCE, encoding="utf-8")
+        self.assertFalse(device_tuning.patch_bingie_cache_mmap())
+        self.assertNotIn("mmap_size", self.path.read_text(encoding="utf-8"))
+
+    def test_missing_module_is_not_an_error(self):
+        self.assertFalse(device_tuning.patch_bingie_cache_mmap())
+
+
 if __name__ == "__main__":
     unittest.main()

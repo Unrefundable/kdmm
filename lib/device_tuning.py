@@ -20,7 +20,9 @@ _HELPER_DATABASE_PATH = (
     f"special://home/addons/{BINGIE_HELPER_ID}/resources/tmdbbingiehelper/lib/files/database.py"
 )
 _HELPER_PRAGMA_ANCHOR = 'connection.execute("PRAGMA foreign_keys=ON")'
-_HELPER_PRAGMA_MMAP_OFF = 'connection.execute("PRAGMA mmap_size=0")'
+_BINGIE_SCACHE_PATH = "special://home/addons/script.module.bingie/resources/modules/bingie/scache.py"
+_BINGIE_SCACHE_PRAGMA_ANCHOR = 'connection.execute("PRAGMA journal_mode=WAL")'
+_PRAGMA_MMAP_OFF = 'connection.execute("PRAGMA mmap_size=0")'
 
 # A Mac has the CPU for 260-item Trakt lists; an Amlogic box does not.
 # Two Trakt pages (40 items) still fill the skin's 25-item widgets.
@@ -64,38 +66,52 @@ def patch_bingie_thread_limit():
         _log(f"Could not patch Bingie thread limit: {exc}", xbmc.LOGWARNING)
 
 
-def patch_helper_database_mmap():
-    """Stop the helper's SQLite connections memory-mapping its databases.
+def _add_mmap_off(special_path, anchor, label):
+    """Insert PRAGMA mmap_size=0 after `anchor`, matching its indent.
 
-    The helper never closes its connections, and each one maps the whole
-    database (about 66 MB for ItemBuilder.db). On a 32-bit Kodi a few hours
-    of browsing fills the address space; Kodi then cannot allocate its video
-    cache and every stream fails to open until Kodi is restarted.
+    Returns True only when the file was changed.
     """
-    path = xbmcvfs.translatePath(_HELPER_DATABASE_PATH)
+    path = xbmcvfs.translatePath(special_path)
     if not os.path.exists(path):
         return False
     try:
         with open(path, "r", encoding="utf-8") as fh:
             raw = fh.read()
-        if _HELPER_PRAGMA_MMAP_OFF in raw:
+        if _PRAGMA_MMAP_OFF in raw:
             return False
-        if _HELPER_PRAGMA_ANCHOR not in raw:
-            _log("Helper database code has changed; mmap patch not applied", xbmc.LOGWARNING)
+        if raw.count(anchor) != 1:
+            _log(f"{label} code has changed; mmap patch not applied", xbmc.LOGWARNING)
             return False
-        indent = raw[raw.rfind("\n", 0, raw.index(_HELPER_PRAGMA_ANCHOR)) + 1:raw.index(_HELPER_PRAGMA_ANCHOR)]
-        updated = raw.replace(
-            _HELPER_PRAGMA_ANCHOR,
-            f"{_HELPER_PRAGMA_ANCHOR}\n{indent}{_HELPER_PRAGMA_MMAP_OFF}",
-            1,
-        )
+        at = raw.index(anchor)
+        indent = raw[raw.rfind("\n", 0, at) + 1:at]
+        updated = raw.replace(anchor, f"{anchor}\n{indent}{_PRAGMA_MMAP_OFF}", 1)
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(updated)
-        _log("Helper databases no longer memory-mapped (takes effect after Kodi restarts)")
+        _log(f"{label} no longer memory-mapped (takes effect after Kodi restarts)")
         return True
     except Exception as exc:
-        _log(f"Could not patch helper database mmap: {exc}", xbmc.LOGWARNING)
+        _log(f"Could not patch {label} mmap: {exc}", xbmc.LOGWARNING)
         return False
+
+
+def patch_helper_database_mmap():
+    """Stop the helper's SQLite connections memory-mapping its databases.
+
+    The helper never closes its connections, and each one maps the whole
+    database. On a 32-bit Kodi a few hours of browsing fills the address
+    space; Kodi then cannot allocate its video cache and streams fail to open
+    ("Open - Unhandled exception") until enough of it is freed again.
+
+    This covers the helper's own DataBase class (TMDb.db and friends).
+    """
+    return _add_mmap_off(_HELPER_DATABASE_PATH, _HELPER_PRAGMA_ANCHOR, "Helper databases")
+
+
+def patch_bingie_cache_mmap():
+    """Same fix for Bingie's SimpleCache, which the helper uses for
+    ItemBuilder.db (about 70 MB, held open several times over) and
+    QuickService.db."""
+    return _add_mmap_off(_BINGIE_SCACHE_PATH, _BINGIE_SCACHE_PRAGMA_ANCHOR, "Bingie cache databases")
 
 
 def _patch_helper_pagemulti_maximum():
@@ -164,5 +180,6 @@ def raise_file_limit():
 def apply_device_tuning():
     patch_bingie_thread_limit()
     patch_helper_database_mmap()
+    patch_bingie_cache_mmap()
     tune_bingie_helper()
     raise_file_limit()
