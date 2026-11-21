@@ -42,10 +42,13 @@ _USERDATA_PATH = xbmcvfs.translatePath(
 )
 # Plugin handle – valid when Kodi invoked us as a resolver.
 ADDON_HANDLE = int(sys.argv[1]) if len(sys.argv) > 1 else -1
-# Kodi 18+ passes "resume:false" as sys.argv[3] when PlayMedia(..., noresume)
-# is used (i.e. "Play from Beginning").  Any other value (or absent) means
-# the normal resume-from-saved-position behaviour applies.
-NO_RESUME = len(sys.argv) > 3 and "resume:false" in sys.argv[3].lower()
+# Kodi passes "resume:true" or "resume:false" as sys.argv[3]. It is only
+# "resume:true" when Kodi's own bookmark matches the exact play link, and
+# Bingie's links differ by entry point (next-episode starts add
+# "&player=kdmm.json&mode=play"), so "resume:false" usually just means Kodi
+# found no bookmark. KDMM keeps its own resume positions, so it resumes
+# unless the skin's "Play from beginning" button set PROP_PLAY_FROM_BEGINNING.
+KODI_RESUME_ARG = sys.argv[3] if len(sys.argv) > 3 else ""
 sys.path.insert(0, os.path.join(_ADDON_PATH, "lib"))
 
 from cache import (  # noqa: E402 (after sys.path)
@@ -83,6 +86,8 @@ PROP_CANDIDATES = "kdmm.candidates"   # JSON list of selected stream candidates
 PROP_PLAYBACK_CONTEXT = "kdmm.playback_context"
 PROP_PENDING_PLAYBACK = "kdmm.pending_playback"
 PROP_PREPARE_DETAILS = "kdmm.prepare_details"
+# Set by the skin's "Play from beginning" button right before PlayMedia.
+PROP_PLAY_FROM_BEGINNING = "kdmm.play_from_beginning"
 
 
 def _log(msg, level=xbmc.LOGINFO):
@@ -419,6 +424,12 @@ def action_play(params):
     year = params.get("year", "").strip()
     query_title = showtitle or title
     force_refresh = params.get("refresh", "0") == "1"
+    # Read and clear at once, so a later play never inherits the request.
+    no_resume = bool(WIN.getProperty(PROP_PLAY_FROM_BEGINNING))
+    WIN.clearProperty(PROP_PLAY_FROM_BEGINNING)
+    if KODI_RESUME_ARG:
+        _log(f"Kodi resume argument: {KODI_RESUME_ARG}; play from beginning: {no_resume}",
+             xbmc.LOGDEBUG)
 
     # Determine catalog type and video_id.
     if action == "play_episode" and season and episode:
@@ -708,7 +719,7 @@ def action_play(params):
         season=season,
         episode=episode,
         year=year,
-        no_resume=NO_RESUME,
+        no_resume=no_resume,
     )
 
 

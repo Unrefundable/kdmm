@@ -99,6 +99,7 @@ PROP_CANDIDATES = "kdmm.candidates"
 PROP_PLAYBACK_CONTEXT = "kdmm.playback_context"
 PROP_PENDING_PLAYBACK = "kdmm.pending_playback"
 PROP_PREPARE_DETAILS = "kdmm.prepare_details"
+PROP_PLAY_FROM_BEGINNING = "kdmm.play_from_beginning"
 
 WATCHED_MARGIN_SECONDS = 60
 MIN_CONTENT_SECONDS = 60
@@ -489,6 +490,9 @@ class BridgePlayer(xbmc.Player):
         )
 
     def onAVStarted(self):
+        # KDMM reads this when it resolves a stream; if something else played,
+        # drop it so a later KDMM play still resumes.
+        WIN.clearProperty(PROP_PLAY_FROM_BEGINNING)
         media_id = WIN.getProperty(PROP_MEDIA_ID)
         if not media_id:
             return

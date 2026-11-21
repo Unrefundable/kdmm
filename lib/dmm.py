@@ -2257,7 +2257,11 @@ def refresh_cached_stream(candidate, season=None, episode=None,
         if not ad_id:
             raise RuntimeError("AllDebrid upload returned no magnet id")
         if not item.get("ready"):
-            raise RuntimeError("Cached AllDebrid source is not currently ready")
+            # AllDebrid no longer holds the files and has started downloading
+            # them again. Waiting is pointless; search for another source.
+            raise CachedStreamUnavailable(
+                f"AllDebrid is downloading cached source {h8} again"
+            )
 
         files_data = _ad_post(
             "/magnet/files",
@@ -2273,7 +2277,7 @@ def refresh_cached_stream(candidate, season=None, episode=None,
             query_title=query_title, year=year,
         )
         if not selected_file:
-            raise RuntimeError(
+            raise CachedStreamUnavailable(
                 f"Cached file is no longer present in AllDebrid magnet: "
                 f"{candidate.get('source_file') or candidate.get('name') or h8}"
             )
